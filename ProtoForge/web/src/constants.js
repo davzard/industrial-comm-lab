@@ -1,0 +1,310 @@
+export const protocolLabels = {
+  modbus_tcp: 'Modbus TCP',
+  modbus_rtu: 'Modbus RTU',
+  opcua: 'OPC-UA',
+  opcua_client: 'OPC-UA Client',
+  mqtt: 'MQTT',
+  http: 'HTTP REST',
+  gb28181: 'GB28181',
+  bacnet: 'BACnet',
+  s7: 'Siemens S7',
+  mc: 'Mitsubishi MC',
+  fins: 'Omron FINS',
+  ab: 'Rockwell AB',
+  opcda: 'OPC-DA',
+  fanuc: 'FANUC FOCAS',
+  mtconnect: 'MTConnect',
+  toledo: 'Mettler-Toledo',
+  profinet: 'PROFINET IO',
+  ethercat: 'EtherCAT',
+  iec104: 'IEC 60870-5-104',
+  iec61850: 'IEC 61850',
+  coap: 'CoAP',
+  dds: 'DDS',
+  dlt645: 'DLT/T 645',
+  cjt188: 'CJ/T 188',
+  mewtocol: 'Panasonic MEWTOCOL',
+  custom_tcp: '自定义TCP',
+  custom_udp: '自定义UDP',
+  s7plus: 'S7Comm-Plus',
+}
+
+export const protocolColors = {
+  modbus_tcp: '#4f46e5',
+  modbus_rtu: '#6366f1',
+  opcua: '#059669',
+  opcua_client: '#0d9488',
+  mqtt: '#d97706',
+  http: '#dc2626',
+  gb28181: '#7c3aed',
+  bacnet: '#0891b2',
+  s7: '#be185d',
+  mc: '#9333ea',
+  fins: '#c2410c',
+  ab: '#15803d',
+  opcda: '#475569',
+  fanuc: '#e11d48',
+  mtconnect: '#0d9488',
+  toledo: '#a16207',
+  profinet: '#2563eb',
+  ethercat: '#7c2d12',
+  iec104: '#0284c7',
+  iec61850: '#0369a1',
+  coap: '#16a34a',
+  dds: '#9333ea',
+  dlt645: '#0891b2',
+  cjt188: '#0d9488',
+  mewtocol: '#ca8a04',
+  custom_tcp: '#6b7280',
+  custom_udp: '#9ca3af',
+  s7plus: '#be185d',
+}
+
+export const protocolTagTypes = {
+  modbus_tcp: 'info',
+  modbus_rtu: 'info',
+  opcua: 'success',
+  opcua_client: 'success',
+  mqtt: 'warning',
+  http: 'error',
+  gb28181: 'info',
+  bacnet: 'info',
+  s7: 'error',
+  mc: 'info',
+  fins: 'warning',
+  ab: 'success',
+  opcda: 'default',
+  fanuc: 'error',
+  mtconnect: 'success',
+  toledo: 'warning',
+  profinet: 'info',
+  ethercat: 'warning',
+  iec104: 'info',
+  iec61850: 'info',
+  coap: 'success',
+  dds: 'info',
+  dlt645: 'info',
+  cjt188: 'success',
+  mewtocol: 'warning',
+  custom_tcp: 'default',
+  custom_udp: 'default',
+  s7plus: 'error',
+}
+
+export const protocolModes = {
+  modbus_tcp: 'TCP',
+  modbus_rtu: 'RTU',
+  opcua: 'Server',
+  opcua_client: 'Client',
+  mqtt: 'Broker',
+  http: 'Server',
+  gb28181: 'SIP',
+  bacnet: 'Server',
+  s7: 'Server',
+  mc: 'Server',
+  fins: 'Server',
+  ab: 'Server',
+  opcda: 'Server',
+  fanuc: 'Server',
+  mtconnect: 'Agent',
+  toledo: 'Server',
+  profinet: 'IO Device',
+  ethercat: 'Slave',
+  iec104: 'Slave',
+  iec61850: 'IED',
+  coap: 'Server',
+  dds: 'Publisher',
+  dlt645: 'Slave',
+  cjt188: 'Slave',
+  mewtocol: 'Server',
+  custom_tcp: 'Server',
+  custom_udp: 'Server',
+  s7plus: 'Server',
+}
+
+export const defaultPorts = {
+  modbus_tcp: 5020,
+  modbus_rtu: '/dev/ttyUSB0',
+  opcua: 4840,
+  opcua_client: 4840,
+  mqtt: 1883,
+  http: 8080,
+  gb28181: 5060,
+  bacnet: 47808,
+  s7: 102,
+  mc: 5000,
+  fins: 9600,
+  ab: 44818,
+  opcda: 51340,
+  fanuc: 8193,
+  mtconnect: 7878,
+  toledo: 1701,
+  profinet: 34964,
+  ethercat: 34980,
+  iec104: 2404,
+  iec61850: 102,
+  coap: 5683,
+  dds: 7400,
+  dlt645: 37120,
+  cjt188: 37121,
+  mewtocol: 2049,
+  custom_tcp: 38000,
+  custom_udp: 38001,
+  s7plus: 10202,
+}
+
+export async function fetchDefaultPorts() {
+  try {
+    const api = (await import('./api.js')).default
+    const info = await api.getProtocolInfo()
+    if (info && Array.isArray(info)) {
+      const ports = {}
+      for (const p of info) {
+        if (p.name && p.default_port !== undefined) {
+          ports[p.name] = p.default_port
+        }
+      }
+      return ports
+    }
+  } catch (e) {
+    // fallback to static defaults
+  }
+  return { ...defaultPorts }
+}
+
+export const deviceStatusMap = {  // FIXED: 硬编码英文标签改为i18n key
+  online: ['success', 'common.online'],
+  running: ['success', 'common.running'],
+  starting: ['warning', 'common.starting'],
+  error: ['error', 'common.error'],
+  stopped: ['default', 'common.stopped'],
+  offline: ['default', 'common.offline'],
+  disabled: ['default', 'common.disabled'],
+}
+
+export const directionColorMap = {
+  in: '#6366f1', out: '#10b981', system: '#f59e0b', write: '#ec4899',
+  recv: '#10b981', send: '#6366f1', inbound: '#6366f1', outbound: '#10b981',
+}
+
+export const directionTagTypeMap = {
+  in: 'info', out: 'success', system: 'warning', write: 'error',
+  recv: 'success', send: 'info', inbound: 'info', outbound: 'success',
+}
+
+export const directionLabelMap = {  // FIXED: 硬编码英文标签改为i18n key
+  in: 'logs.directionLabels.in', out: 'logs.directionLabels.out', system: 'logs.directionLabels.system', write: 'logs.directionLabels.write',
+  recv: 'logs.directionLabels.recv', send: 'logs.directionLabels.send', inbound: 'logs.directionLabels.inbound', outbound: 'logs.directionLabels.outbound',
+}
+
+export function getProtocolLabel(name) {
+  return protocolLabels[name] || name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+}
+
+export function getProtocolColor(name) {
+  const palette = ['#4f46e5', '#059669', '#d97706', '#dc2626', '#7c3aed', '#0891b2', '#be185d', '#9333ea', '#c2410c', '#15803d', '#e11d48', '#0d9488', '#a16207', '#2563eb', '#7c2d12']
+  if (protocolColors[name]) return protocolColors[name]
+  let hash = 0
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash)
+  return palette[Math.abs(hash) % palette.length]
+}
+
+export const defaultPointConfig = {
+  name: 'value',
+  address: '0',
+  data_type: 'float32',
+  access: 'rw',
+  generator_type: 'random',
+  gen_interval: 0,
+  min_value: 0,
+  max_value: 100,
+  fixed_value: null,
+  unit: '',
+  description: '',
+  generator_config: {},
+}
+
+export const popularTemplateIds = [
+  'modbus_temperature_sensor', 'siemens_s7_1200', 'smart_lock', 'flow_meter',
+  'modbus_mitsubishi_fx5u', 'modbus_fanuc_cnc', 'ab_controllogix', 'fins_cp1h',
+  'toledo_scale', 'opcda_scada_server', 'mtconnect_mill', 'gb28181_ptz_camera',
+]
+
+export const defaultProtocol = 'modbus_tcp'
+
+export const PASSWORD_MASK = '***'
+
+export const dataTypeOptions = [
+  { label: 'dataTypes.bool', value: 'bool' },
+  { label: 'dataTypes.int16', value: 'int16' },
+  { label: 'dataTypes.int32', value: 'int32' },
+  { label: 'dataTypes.uint16', value: 'uint16' },
+  { label: 'dataTypes.uint32', value: 'uint32' },
+  { label: 'dataTypes.float32', value: 'float32' },
+  { label: 'dataTypes.float64', value: 'float64' },
+  { label: 'dataTypes.string', value: 'string' },
+]
+
+export const generatorTypeOptions = [
+  { label: 'generatorTypes.fixed', value: 'fixed' },
+  { label: 'generatorTypes.random', value: 'random' },
+  { label: 'generatorTypes.random_walk', value: 'random_walk' },
+  { label: 'generatorTypes.sine', value: 'sine' },
+  { label: 'generatorTypes.triangle', value: 'triangle' },
+  { label: 'generatorTypes.sawtooth', value: 'sawtooth' },
+  { label: 'generatorTypes.square', value: 'square' },
+  { label: 'generatorTypes.increment', value: 'increment' },
+  { label: 'generatorTypes.script', value: 'script' },
+  { label: 'generatorTypes.physical', value: 'physical' },
+]
+
+export const accessModeOptions = [
+  { label: 'accessModes.r', value: 'r' },
+  { label: 'accessModes.w', value: 'w' },
+  { label: 'accessModes.rw', value: 'rw' },
+]
+
+// 生成器配置参数schema：每种生成器支持的可配置参数
+// 注意：参数key必须与后端 DynamicValueGenerator._config 读取的key一致
+export const generatorConfigSchema = {
+  fixed: [],
+  constant: [],
+  random: [],
+  random_walk: [
+    { key: 'step_size', label: 'stepSize', type: 'number', default: 1.0 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  sine: [
+    { key: 'frequency', label: 'frequency', type: 'number', default: 0.1 },
+    { key: 'phase', label: 'phase', type: 'number', default: 0.0 },
+    { key: 'amplitude', label: 'amplitude', type: 'number', default: 50.0 },
+    { key: 'offset', label: 'offset', type: 'number', default: 50.0 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  triangle: [
+    { key: 'frequency', label: 'frequency', type: 'number', default: 0.1 },
+    { key: 'phase', label: 'phase', type: 'number', default: 0.0 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  sawtooth: [
+    { key: 'frequency', label: 'frequency', type: 'number', default: 0.1 },
+    { key: 'phase', label: 'phase', type: 'number', default: 0.0 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  square: [
+    { key: 'frequency', label: 'frequency', type: 'number', default: 0.1 },
+    { key: 'phase', label: 'phase', type: 'number', default: 0.0 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  increment: [
+    { key: 'step', label: 'step', type: 'number', default: 1 },
+    { key: 'frequency', label: 'frequency', type: 'number', default: 0.1 },
+    { key: 'noise', label: 'noise', type: 'number', default: 0.0 },
+  ],
+  script: [
+    { key: 'script', label: 'script', type: 'text', default: 'result = value + 0' },
+  ],
+  physical: [
+    { key: 'config_string', label: 'configString', type: 'text', default: '' },
+  ],
+}

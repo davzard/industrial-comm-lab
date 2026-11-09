@@ -1,0 +1,108 @@
+# ProtoForge 简易部署（新手推荐）
+# 使用预构建的 Docker 镜像 + SQLite，无需克隆代码，无需编译
+#
+# 启动：docker compose -f docker-compose.simple.yml up -d
+# 停止：docker compose -f docker-compose.simple.yml down
+# 地址：http://localhost:8000
+# 登录：admin / （启动时设置的密码）
+#
+# ✅ 常用协议端口已默认全部映射（Modbus / S7 / OPC-UA / MQTT 等），
+#    一般无需修改本文件即可直接从外部连接仿真协议。
+#
+# ⚠ 如需修改：YAML 对缩进极其敏感，列表项必须与其他 "- " 条目
+#   保持完全相同的空格缩进（不要用 Tab 键），否则会报
+#   "did not find expected '-' indicator" 之类的解析错误。
+#
+# 端口说明：
+#   8000  - Web 管理界面 / REST API
+#   5020  - Modbus TCP
+#   4840  - OPC-UA
+#   1883  - MQTT
+#   5060  - GB28181 SIP (TCP + UDP)
+#   47808 - BACnet (UDP)
+#   102   - Siemens S7
+#   8080  - HTTP REST
+#   5000  - Mitsubishi MC
+#   9600  - Omron FINS (UDP)
+#   44818 - Rockwell AB
+#   51340 - OPC-DA
+#   8193  - FANUC FOCAS
+#   7878  - MTConnect
+#   1701  - Mettler-Toledo
+#   34964 - PROFINET
+#   34980 - EtherCAT
+#   6000-6999 - GB28181 RTP 媒体流（端口范围较大，默认未映射，按需取消注释）
+
+services:
+  protoforge:
+    image: suoten/protoforge:1.11.0
+    container_name: protoforge
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && python -m protoforge.cli demo
+    ports:
+      - "8000:8000"
+      # --- Modbus TCP ---
+      - "5020:5020"
+      # --- OPC-UA ---
+      - "4840:4840"
+      # --- MQTT ---
+      - "1883:1883"
+      # --- GB28181 视频监控 (SIP 信令 TCP+UDP) ---
+      - "5060:5060"
+      - "5060:5060/udp"
+      # --- BACnet (UDP) ---
+      - "47808:47808/udp"
+      # --- Siemens S7 ---
+      - "102:102"
+      # --- HTTP REST（容器内已通过 PROTOFORGE_HTTP_PORT 固定为 8080） ---
+      - "8080:8080"
+      # --- Mitsubishi MC ---
+      - "5000:5000"
+      # --- Omron FINS (UDP) ---
+      - "9600:9600/udp"
+      # --- Rockwell AB ---
+      - "44818:44818"
+      # --- OPC-DA ---
+      - "51340:51340"
+      # --- FANUC FOCAS ---
+      - "8193:8193"
+      # --- MTConnect ---
+      - "7878:7878"
+      # --- Mettler-Toledo ---
+      - "1701:1701"
+      # --- PROFINET ---
+      - "34964:34964"
+      # --- EtherCAT ---
+      - "34980:34980"
+      # --- GB28181 RTP 媒体流端口范围（需外部播放视频流时取消注释） ---
+      # - "6000-6999:6000-6999/udp"
+    # S7 默认端口 102 是 Linux 特权端口（<1024），容器以非 root 用户运行，
+    # 需要此能力才能绑定；若不需要 S7 可删除此项
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      PROTOFORGE_DB_PATH: data/protoforge.db
+      PROTOFORGE_LOG_LEVEL: info
+      PROTOFORGE_ADMIN_PASSWORD: ${PROTOFORGE_ADMIN_PASSWORD:-admin}
+      PROTOFORGE_JWT_SECRET: ${PROTOFORGE_JWT_SECRET:-protoforge_default_jwt_secret_change_in_production}
+      PROTOFORGE_HTTP_PORT: "8080"   # FIXED: 默认端口已改为 18080（避开 EdgeLite 冲突），容器内固定回 8080 与映射保持一致
+      PROTOFORGE_DEMO_MODE: "1"
+    volumes:
+      - protoforge-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # FIXED: 添加日志轮转配置
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  protoforge-data:

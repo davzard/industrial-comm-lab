@@ -1,0 +1,22 @@
+# .NET build artifacts (CommLab)
+bin/
+obj/
+logs/
+*.user
+.vs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+
+# Node
+node_modules/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/

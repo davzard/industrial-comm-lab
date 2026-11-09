@@ -1,0 +1,1388 @@
+"""Simulation engine orchestrating protocols, devices, and scenarios."""
+
+import asyncio
+import contextlib
+import logging
+import re
+import socket
+import time
+from typing import Any
+
+from protoforge.engine.device import DeviceInstance
+from protoforge.engine.event_bus import (
+    DeviceCreatedEvent,
+    DeviceRemovedEvent,
+    DeviceStartedEvent,
+    DeviceStoppedEvent,
+    EventBus,
+    ProtocolStatusEvent,
+)
+from protoforge.engine.generator import DataGenerator
+from protoforge.engine.network_sim import NetworkSimulator
+from protoforge.engine.state_machine import DeviceState
+from protoforge.models.device import DeviceConfig, DeviceInfo, DeviceStatus, GeneratorType, PointValue
+from protoforge.models.scenario import ScenarioConfig, ScenarioDetail, ScenarioInfo, ScenarioStatus
+from protoforge.protocols.base import ProtocolServer, ProtocolStatus
+from protoforge.simulation.fault.propagation import FaultPropagation
+from protoforge.simulation.scenario import Scenario
+from protoforge.simulation.timeseries import TimeSeriesManager
+
+logger = logging.getLogger(__name__)
+
+_VALID_ID_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\-.]{0,127}$')
+
+
+def _validate_entity_id(entity_id: str, entity_type: str = "Entity") -> None:
+    if not entity_id or not isinstance(entity_id, str):
+        raise ValueError(f"{entity_type} ID must be a non-empty string")
+    if not _VALID_ID_PATTERN.match(entity_id):
+        raise ValueError(
+            f"{entity_type} ID '{entity_id}' is invalid. "
+            "Must start with alphanumeric, contain only letters, digits, '_', '-', '.', max 128 chars"
+        )
+
+
+# FIXED: 扩展敏感字段列表，覆盖更多可能泄露的敏感信息
+SENSITIVE_KEYS: set[str] = {
+    "password", "passwd", "pwd",  # 密码
+    "secret", "token", "api_key", "apikey", "api-key",  # 密钥/令牌
+    "auth", "authorization", "auth_key", "authkey",  # 认证
+    "credential", "credentials",  # 凭证
+    "private", "private_key", "privatekey",  # 私钥
+    "access_key", "accesskey", "access_token",  # 访问密钥
+    "bearer", "jwt",  # Bearer/JWT
+    "session", "session_id",  # 会话
+    "cookie", "csrf",  # Cookie/CSRF
+    "crypt_key", "encrypt_key", "encryption_key",  # 加密密钥
+}
+
+# 不参与日志记录的字段（这些字段不应出现在日志中）
+EXCLUDED_KEYS: set[str] = {
+    "auth_password", "secret", "token",
+}
+
+
+def _sanitize_config(config: dict[str, Any]) -> dict[str, Any]:
+    """脱敏配置中的敏感字段"""
+    if not config:
+        return config
+    return {
+        k: ("***") if k.lower() in SENSITIVE_KEYS or k in EXCLUDED_KEYS else v
+        for k, v in config.items()
+    }
+
+
+def _is_port_in_use(port: int, host: str = "0.0.0.0", protocol: str = "tcp") -> bool:
+    if protocol == "udp":
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                s.bind((host, port))
+            except OSError:
+                return True
+        return False
+    # TCP: a successful outbound connect proves a live listener even when a
+    # re-bind would silently succeed. On Windows, SO_REUSEADDR lets a wildcard
+    # (0.0.0.0) bind coexist with an existing 127.0.0.1 listener on the same
+    # port, after which connections are routed to either socket at random --
+    # the bind-only probe cannot see that conflict, so probe with a connect
+    # against loopback and the configured host first.
+    probe_hosts = ["127.0.0.1"]
+    if host not in ("", "0.0.0.0", "*", "::", "127.0.0.1"):
+        probe_hosts.append(host)
+    for probe_host in probe_hosts:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.25)
+            try:
+                if s.connect_ex((probe_host, port)) == 0:
+                    return True
+            except OSError:
+                pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError:
+            return True
+    return False
+
+
+def _is_serial_path(host: str) -> bool:
+    return (host.startswith("/dev/tty") or
+            host.startswith("/dev/serial") or
+            host.upper().startswith("COM"))
+
+
+def _find_free_port(start_port: int, host: str = "0.0.0.0", max_tries: int = 100, protocol: str = "tcp") -> int:
+    for offset in range(max_tries):
+        port = start_port + offset
+        if not _is_port_in_use(port, host, protocol):
+            return port
+    raise RuntimeError(f"No free port found in range {start_port}-{start_port + max_tries - 1}")
+
+
+class SimulationEngine:
+    def __init__(self, event_bus: EventBus | None = None, tick_interval: float = 1.0):
+        self._protocol_servers: dict[str, ProtocolServer] = {}
+        self._last_protocol_configs: dict[str, dict[str, Any]] = {}  # FIXED: 记录每个协议最近一次成功启动的配置，供高级配置弹窗回显实际值（而非 schema 默认值）
+        self._devices: dict[str, DeviceInstance] = {}
+        self._devices_lock = asyncio.Lock()  # FIXED: S7 - add lock for _devices dict concurrent access
+        self._scenarios: dict[str, ScenarioConfig] = {}
+        self._scenario_instances: dict[str, Scenario] = {}
+        self._scenario_status: dict[str, ScenarioStatus] = {}
+        self._scenarios_lock = asyncio.Lock()  # FIXED-P1: 保护场景字典并发访问
+        self._generator = DataGenerator()
+        self._tick_task: asyncio.Task | None = None
+        self._running = False
+        self._event_bus = event_bus
+        self._tick_interval = tick_interval
+
+        # v1.11.0 大规模仿真：tick 分片——每处理 tick_shard_size 台设备让出
+        # 一次事件循环（await asyncio.sleep(0)），避免 1000+ 设备时单 tick
+        # 长时间霸占循环导致 API/协议响应抖动。0 或 1 = 关闭分片。
+        self.tick_shard_size = 100
+        # v1.11.0 tick 时长观测（benchmark/白皮书与运行时可观测共用）
+        self.tick_stats: dict[str, float] = {
+            "tick_avg_ms": 0.0, "tick_max_ms": 0.0, "tick_count": 0.0}
+        self._fault_propagation = FaultPropagation()
+        # 调试 Force：device_id -> {point_name: value}，每个 tick 重新施加，压过生成器
+        self._point_overrides: dict[str, dict[str, Any]] = {}
+        self._timeseries_manager = TimeSeriesManager()
+        self._network_sim = NetworkSimulator(enabled=False)
+        # P4: 时序模式 & 事件驱动记录
+        self._device_ts_patterns: dict[str, dict[str, Any]] = {}
+        self._event_driven_record: bool = False
+        self._event_record_threshold: float = 0.0
+        self._last_recorded_values: dict[str, dict[str, float]] = {}
+        # 仿真真实度: 扫描周期跟踪 & 时序记录
+        self._device_last_tick: dict[str, float] = {}
+        self._timeseries_record_interval: float = 0.0
+        self._device_snapshots: dict[str, dict[str, Any]] = {}
+
+    def register_protocol(self, server: ProtocolServer) -> None:
+        if server.protocol_name in self._protocol_servers:
+            logger.warning("Protocol %s already registered, overwriting", server.protocol_name)
+        # 设置写回调：当外部客户端通过协议写入时，传播到 DeviceInstance
+        server.set_write_callback(self._on_protocol_write)
+        # 设置设备状态查询回调
+        server.set_device_state_provider(self._get_device_state_for_protocol)
+        self._protocol_servers[server.protocol_name] = server
+        logger.info("Registered protocol: %s", server.protocol_name)
+
+    def _get_device_state_for_protocol(self, device_id: str) -> str:
+        """获取设备状态字符串（供协议服务器查询）。
+
+        :param device_id: 设备 ID
+        :return: 状态字符串 ("run"/"stop"/"starting"/"stopping"/"error"/...)
+        """
+        instance = self._devices.get(device_id)
+        if not instance:
+            return "run"  # 未知设备默认返回 run，不阻止正常请求
+        state = instance.device_state
+        # 映射 DeviceState 到状态字符串
+        mapping = {
+            DeviceState.RUN: "run",
+            DeviceState.STOP: "stop",
+            DeviceState.STARTING: "starting",
+            DeviceState.STOPPING: "stopping",
+            DeviceState.ERROR: "error",
+            DeviceState.MAINTENANCE: "maintenance",
+            DeviceState.PROGRAM: "program",
+        }
+        return mapping.get(state, "run")
+
+    async def _restore_device_states(self) -> None:
+        """引擎启动时从数据库恢复设备状态快照。"""
+        try:
+            from protoforge.engine.registry import get_database
+            db = get_database()
+            if db is None:
+                return
+            snapshots = await db.load_device_snapshots()
+            for snapshot in snapshots:
+                device_id = snapshot.get("device_id") or snapshot.get("id")
+                if device_id and device_id in self._devices:
+                    await self.import_device_snapshot(device_id, snapshot)
+                    logger.info("Restored device state for %s", device_id)
+                else:
+                    # 快照没有匹配的 device_id，应用到所有设备
+                    for did in self._devices:
+                        await self.import_device_snapshot(did, snapshot)
+                    logger.debug("Applied snapshot to all devices")
+        except RuntimeError:
+            logger.debug("Database not available, skipping device state restore")
+        except Exception as e:
+            logger.warning("Failed to restore device states: %s", e)
+
+    async def import_device_snapshot(self, device_id: str, snapshot: dict[str, Any]) -> bool:
+        """导入设备状态快照。"""
+        instance = self._devices.get(device_id)
+        if not instance:
+            return False
+        point_values = snapshot.get("point_values", {})
+        for name, value in point_values.items():
+            if name in instance._point_values:
+                instance._point_values[name] = value
+        return True
+
+    # -- P4: 时序模式管理 -------------------------------------------------
+
+    def configure_device_ts_patterns(self, device_id: str, patterns: dict[str, Any]) -> None:
+        """配置设备的时间序列模式。"""
+        self._device_ts_patterns[device_id] = patterns
+        logger.info("Configured TS patterns for device %s: %d patterns", device_id, len(patterns))
+
+    def clear_device_ts_patterns(self, device_id: str) -> None:
+        """清除设备的时间序列模式。"""
+        self._device_ts_patterns.pop(device_id, None)
+        logger.debug("Cleared TS patterns for device %s", device_id)
+
+    # -- P4: 事件驱动记录 -------------------------------------------------
+
+    def configure_timeseries_recording(self, interval: float) -> None:
+        """配置时序数据记录间隔。
+
+        :param interval: 记录间隔（秒），0 表示禁用
+        """
+        self._timeseries_record_interval = interval
+        logger.info("Timeseries recording interval set to %.2fs", interval)
+
+    async def save_device_snapshot(self, device_id: str, name: str = "default") -> str | None:
+        """保存设备状态快照。
+
+        :param device_id: 设备 ID
+        :param name: 快照名称
+        :return: 快照 ID，失败返回 None
+        """
+        instance = self._devices.get(device_id)
+        if not instance:
+            return None
+        snapshot_id = f"{device_id}_{name}_{int(time.time())}"
+        point_values = {}
+        for p in instance.read_all_points():
+            point_values[p.name] = p.value
+        self._device_snapshots[snapshot_id] = {
+            "device_id": device_id,
+            "name": name,
+            "point_values": point_values,
+            "timestamp": time.time(),
+        }
+        logger.info("Saved snapshot %s for device %s", snapshot_id, device_id)
+        return snapshot_id
+
+    def configure_event_driven_recording(self, enabled: bool, threshold: float = 0.0) -> None:
+        """配置事件驱动时序记录。
+
+        :param enabled: 是否启用
+        :param threshold: 值变化阈值（Deadband），变化超过此值才记录
+        """
+        self._event_driven_record = enabled
+        self._event_record_threshold = threshold
+        if not enabled:
+            self._last_recorded_values.clear()
+        logger.info("Event-driven recording %s (threshold=%.4f)", "enabled" if enabled else "disabled", threshold)
+
+    async def _check_event_driven_record(self, instance: DeviceInstance, timestamp: float) -> None:
+        """检查设备点位值变化，超过阈值时记录到数据库。"""
+        if not self._event_driven_record:
+            return
+        device_id = instance.config.id
+        prev_values = self._last_recorded_values.get(device_id)
+        records = []
+        for pv in instance.read_all_points():
+            if not isinstance(pv.value, (int, float)):
+                continue
+            val = float(pv.value)
+            if prev_values is None:
+                # 首次记录所有点位
+                records.append({
+                    "device_id": device_id,
+                    "point_name": pv.name,
+                    "value": val,
+                    "timestamp": timestamp,
+                })
+            else:
+                prev_val = prev_values.get(pv.name)
+                if prev_val is None or abs(val - prev_val) > self._event_record_threshold:
+                    records.append({
+                        "device_id": device_id,
+                        "point_name": pv.name,
+                        "value": val,
+                        "timestamp": timestamp,
+                    })
+        # 更新上次记录值
+        current_values = {}
+        for pv in instance.read_all_points():
+            if isinstance(pv.value, (int, float)):
+                current_values[pv.name] = float(pv.value)
+        self._last_recorded_values[device_id] = current_values
+        # 写入数据库
+        if records:
+            try:
+                from protoforge.engine.registry import get_database
+                db = get_database()
+                if db is not None:
+                    await db.save_timeseries_batch(records)
+            except RuntimeError:
+                logger.debug("Database not available for event-driven recording")
+            except Exception as e:
+                logger.warning("Event-driven recording failed for %s: %s", device_id, e)
+
+    async def _on_protocol_write(self, device_id: str, point_name: str, value: Any) -> bool:
+        """协议层写回调：将外部客户端的写入操作传播到 DeviceInstance。
+
+        当外部客户端（如 Modbus master、OPC-UA client、S7 client）通过协议
+        写入数据时，协议 server 通过此回调将写入操作传播到引擎的
+        DeviceInstance，确保内部状态与协议数据一致。
+
+        :param device_id: 设备 ID
+        :param point_name: 点位名称
+        :param value: 写入值
+        :return: 是否写入成功
+        """
+        instance = self._devices.get(device_id)
+        if not instance:
+            logger.warning("on_protocol_write: device %s not found", device_id)
+            return False
+        try:
+            return await instance.write_point(point_name, value)
+        except Exception as e:
+            logger.warning("on_protocol_write error for %s/%s: %s", device_id, point_name, e)
+            _swallowed = False
+            return _swallowed
+
+    def setup_debug_callbacks(self, log_bus) -> None:
+        for name, server in self._protocol_servers.items():
+            if hasattr(server, 'set_debug_callback'):
+                def make_callback(proto_name):
+                    def callback(direction, msg_type, summary, device_id="", detail=None):
+                        log_bus.emit(
+                            protocol=proto_name,
+                            direction=direction,
+                            device_id=device_id,
+                            message_type=msg_type,
+                            summary=summary,
+                            detail=detail or {},
+                        )
+                    return callback
+                server.set_debug_callback(make_callback(name))
+
+    def get_protocols(self) -> list[dict[str, Any]]:
+        from protoforge.config import get_protocol_port_map
+        port_map = get_protocol_port_map()
+        result = []
+        for name, server in self._protocol_servers.items():
+            port_info = port_map.get(name, {})
+            # FIXED(用户反馈 502/5020 不一致): 合成"实际生效配置"供高级配置弹窗回显。
+            # 此前 running_config 只记录显式传入的启动配置 —— 空配置一键启动时为空字典，
+            # 弹窗回退到 schema 默认值；而卡片显示注册表默认端口，一旦用户自定义过端口
+            # （或协议内部自动换端口），卡片与弹窗必然各说各话。
+            # 现统一为：schema 默认打底 → 用户启动配置覆盖 → 实际监听端口(actual_port)最终权威。
+            try:
+                props = (server.get_config_schema() or {}).get("properties") or {}
+                effective = {
+                    k: v.get("default")
+                    for k, v in props.items()
+                    if isinstance(v, dict) and v.get("default") is not None
+                }
+            except Exception as e:
+                logger.debug("get_protocols: ignored exception: %s", e)
+                effective = {}
+            effective.update({
+                k: v for k, v in self._last_protocol_configs.get(server.protocol_name, {}).items()
+                if v is not None and v != ""
+            })
+            try:
+                actual_port = getattr(server, "actual_port", None)
+            except Exception as e:
+                logger.debug("get_protocols: ignored exception: %s", e)
+                actual_port = None
+            if actual_port:
+                effective["port"] = actual_port
+            result.append({
+                "name": server.protocol_name,
+                "display_name": server.protocol_display_name,
+                "description": getattr(server, 'protocol_description', ''),
+                "version": getattr(server, 'protocol_version', '1.0.0'),
+                "status": server.status.value,
+                "default_port": port_info.get("port", 0),
+                "effective_port": effective.get("port") or port_info.get("port", 0),
+                "config_schema": server.get_config_schema(),
+                "running_config": effective,
+            })
+        return result
+
+    def is_protocol_running(self, protocol_name: str) -> bool:
+        server = self._protocol_servers.get(protocol_name)
+        return server is not None and server.status == ProtocolStatus.RUNNING
+
+    _MAX_START_RETRIES = 3
+    _RETRY_DELAY_SECONDS = 2.0
+    _RETRYABLE_ERRORS = ("connection refused", "timed out", "connection reset", "temporarily unavailable")
+
+    async def start_protocol(self, protocol_name: str, config: dict[str, Any], restart: bool = False) -> None:
+        server = self._protocol_servers.get(protocol_name)
+        if not server:
+            raise ValueError(f"Unknown protocol: {protocol_name}")
+        if server.status == ProtocolStatus.RUNNING:
+            if not restart:
+                # FIXED: 已运行时默认跳过（幂等启动）；显式 restart=True 时按新配置重启
+                logger.info("Protocol %s is already running, skipping", protocol_name)
+                return
+            # FIXED(Issue: custom_tcp 端口改不了): 运行中的协议带配置再次启动 = 按新配置重启。
+            # 此前静默返回 ok，用户在"高级配置"里改端口后点启动，界面提示成功但端口纹丝不动
+            logger.info("Protocol %s is running, restarting with new config (port=%s)",
+                        protocol_name, config.get("port"))
+            try:
+                await server.stop()
+            except Exception as stop_err:
+                logger.warning("Error stopping protocol %s before restart: %s", protocol_name, stop_err)
+        logger.info("Starting protocol %s with config: %s", protocol_name, _sanitize_config(config))
+
+        # FIXED: 绑定地址预校验 —— 用户常把外部服务器 IP（EMQX/SIP 平台等）误填为
+        # 监听地址（如 MQTT host 填 EMQX IP），启动时绑定失败且难以定位。提前拦截。
+        bind_host = config.get("host", "0.0.0.0")
+        if bind_host and not _is_serial_path(bind_host):
+            from protoforge.core.netutils import is_local_bind_host, list_local_ips
+            if not is_local_bind_host(str(bind_host)):
+                raise ValueError(
+                    f"Host '{bind_host}' is not a local NIC address and cannot be bound. "
+                    f"Tip: use a local IP or 0.0.0.0 for the protocol service; to reach an external "
+                    f"server (EMQX/SIP etc.), configure it on the device instead. "
+                    f"Local addresses: {', '.join(list_local_ips())}"
+                )
+
+        original_port = config.get("port")
+
+        # 引擎层端口检测：启动前检查端口是否被占用
+        if "port" in config and isinstance(config["port"], int):
+            if config["port"] < 1 or config["port"] > 65535:
+                raise ValueError(f"Invalid port {config['port']}, must be between 1 and 65535")
+            host = config.get("host", "0.0.0.0")
+            # FIXED-P0: GB28181/BACnet 使用 UDP，需要用 SOCK_DGRAM 检测端口
+            port_protocol = "udp" if protocol_name in ("gb28181", "bacnet") else "tcp"
+            # FIXED(v1.4.1): 特权端口预检 —— Linux/Docker 下绑定 <1024 端口需要 root 或
+            # CAP_NET_BIND_SERVICE（如 S7 默认端口 102）。此前 PermissionError 被 _is_port_in_use
+            # 误判为"端口被占用"，自动换端口又连续撞上 103..1023 的权限墙，最终报
+            # "No free port found"（API 503），用户无法理解。这里用测试 socket 提前探测，
+            # 区分"权限不足"与"真被占用"，给出可操作提示。
+            if host and not _is_serial_path(host) and config["port"] < 1024:
+                af = socket.AF_INET6 if ":" in str(host) else socket.AF_INET
+                sock_type = socket.SOCK_DGRAM if port_protocol == "udp" else socket.SOCK_STREAM
+                try:
+                    with socket.socket(af, sock_type) as probe:
+                        probe.bind((str(host) or "0.0.0.0", config["port"]))
+                except PermissionError as perm_err:
+                    raise RuntimeError(
+                        f"Port {config['port']} is a privileged port (<1024) and binding it was denied. "
+                        f"On Linux/Docker it requires root or CAP_NET_BIND_SERVICE; on Windows it may be "
+                        f"a system-reserved port range. Fixes: run the Docker container with "
+                        f"--cap-add NET_BIND_SERVICE, or change the protocol port to >= 1024 (e.g. 1102) "
+                        f"in advanced config and point clients to the new port. "
+                        f"(特权端口（<1024）绑定被拒绝：Linux/Docker 需 root 或 --cap-add NET_BIND_SERVICE；"
+                        f"也可在高级配置中把端口改为 1024 以上，客户端同步修改)"
+                    ) from perm_err
+                except OSError:
+                    pass  # 其他绑定错误（如端口真的被占用）交由下方占用检测处理
+            if host and not _is_serial_path(host) and _is_port_in_use(config["port"], host, port_protocol):
+                original_port = config["port"]
+                new_port = _find_free_port(original_port + 1, host, protocol=port_protocol)
+                logger.warning(
+                    "Port %d is in use for %s, auto-switching to %d",
+                    original_port, protocol_name, new_port,
+                )
+                config["port"] = new_port
+                config["_port_changed"] = True
+                config["_original_port"] = original_port
+
+        for attempt in range(1, self._MAX_START_RETRIES + 1):
+            try:
+                await server.start(config)
+
+                # FIXED: 协议启动后再次检测实际端口（协议内部可能自动更换端口）
+                # 从协议服务器获取实际端口（如果有 actual_port 属性）
+                if hasattr(server, 'actual_port'):
+                    actual_port = server.actual_port
+                    if original_port and actual_port != original_port:
+                        config["port"] = actual_port
+                        config["_port_changed"] = True
+                        config["_original_port"] = original_port
+                        logger.info(
+                            "Protocol %s is actually listening on port %d (requested: %d)",
+                            protocol_name, actual_port, original_port
+                        )
+
+                for _i in range(10):  # FIXED-H07: 增加等待次数从5到10，超时从1s增加到2s，适应慢启动场景
+                    await asyncio.sleep(0.2)
+                    if server.status == ProtocolStatus.ERROR:
+                        break
+                if server.status == ProtocolStatus.ERROR:
+                    port_info = ""
+                    if "port" in config:
+                        port_info = f" (port {config['port']})"
+                    error_msg = f"Protocol server entered ERROR state after start{port_info}. Possible causes: port conflict, permission denied, or config error. Check server logs for details."
+                    logger.error("Protocol %s: %s", protocol_name, error_msg)
+                    try:
+                        await server.stop()
+                    except Exception as stop_err:
+                        logger.warning("Error stopping protocol %s after ERROR state: %s", protocol_name, stop_err)
+                    raise RuntimeError(f"Failed to start protocol {protocol_name}: {error_msg}")
+                logger.info("Protocol %s started", protocol_name)
+                # FIXED: 记录实际生效的启动配置（剔除下划线开头的内部标记），高级配置弹窗回显用
+                self._last_protocol_configs[protocol_name] = {
+                    k: v for k, v in config.items() if not str(k).startswith("_")
+                }
+                for dev_id, instance in list(self._devices.items()):
+                    if instance.protocol == protocol_name:
+                        try:
+                            await server.create_device(instance.config)
+                            logger.info("Re-registered device %s to newly started protocol %s", dev_id, protocol_name)
+                        except Exception as reg_err:
+                            logger.debug("Device %s already registered or registration failed: %s", dev_id, reg_err)
+                        # FIXED: 协议启动后自动启动该协议下的设备（如果设备未在线）
+                        if instance.status != DeviceStatus.ONLINE:
+                            try:
+                                instance.start()
+                                logger.info("Auto-started device %s after protocol %s start", dev_id, protocol_name)
+                            except Exception as start_err:
+                                logger.warning("Failed to auto-start device %s: %s", dev_id, start_err)
+                if self._event_bus:
+                    await self._event_bus.publish_safe(ProtocolStatusEvent(
+                        protocol_name=protocol_name,
+                        old_status="stopped",
+                        new_status="running",
+                    ))
+                return  # SUCCESS
+            except Exception as e:
+                logger.debug("start_protocol: ignored exception: %s", e)
+                error_str = str(e).lower()
+                is_retryable = any(err in error_str for err in self._RETRYABLE_ERRORS)
+                if is_retryable and attempt < self._MAX_START_RETRIES:
+                    logger.warning(
+                        "Protocol %s start attempt %d/%d failed (retryable): %s — retrying in %.1fs",
+                        protocol_name, attempt, self._MAX_START_RETRIES, e, self._RETRY_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(self._RETRY_DELAY_SECONDS)
+                    continue
+                else:
+                    logger.exception("Failed to start protocol %s: %s", protocol_name, e)
+                    raise RuntimeError(f"Failed to start protocol {protocol_name}: {e}") from e
+
+    async def stop_protocol(self, protocol_name: str) -> None:
+        server = self._protocol_servers.get(protocol_name)
+        if not server:
+            raise ValueError(f"Unknown protocol: {protocol_name}")
+        try:
+            await server.stop()
+            logger.info("Protocol %s stopped", protocol_name)
+            if self._event_bus:
+                await self._event_bus.publish_safe(ProtocolStatusEvent(
+                    protocol_name=protocol_name,
+                    old_status="running",
+                    new_status="stopped",
+                ))
+        except Exception as e:
+            logger.exception("Failed to stop protocol %s: %s", protocol_name, e)
+            raise RuntimeError(f"Failed to stop protocol {protocol_name}: {e}") from e
+
+    async def create_device(self, config: DeviceConfig, allow_update: bool = False) -> DeviceInfo:
+        async with self._devices_lock:  # FIXED: S7 - protect _devices dict access
+            if config.id in self._devices:
+                if allow_update:
+                    logger.warning("Device %s already exists, updating instead", config.id)
+                    # Release lock before calling update_device which also acquires it
+                else:
+                    raise ValueError(f"Device '{config.id}' already exists. Use update_device() to modify it, or delete it first.")
+            if config.id not in self._devices:
+                instance = DeviceInstance(config, self._generator)
+                self._devices[config.id] = instance
+            else:
+                instance = self._devices[config.id]  # FIXED-P0: 锁内获取instance引用，避免锁释放后KeyError
+
+        if allow_update and instance.config != config:  # FIXED-P0: 使用锁内获取的instance引用，避免锁释放后访问_devices
+            # Need to update - release lock first to avoid deadlock with update_device
+            return await self.update_device(config.id, config)
+
+        server = self._protocol_servers.get(config.protocol)
+        if server and server.status == ProtocolStatus.RUNNING:
+            try:
+                await server.create_device(config)
+                instance.start()
+            except Exception as e:
+                logger.warning("Failed to sync device %s to protocol server: %s", config.id, e)
+
+        if self._event_bus:
+            await self._event_bus.publish_safe(DeviceCreatedEvent(
+                device_id=config.id,
+                protocol=config.protocol,
+                protocol_config=config.protocol_config or {},
+            ))
+
+        # EdgeLite 推送已由 IntegrationManager 通过 EventBus 事件自动处理
+        # 不再在此处直接调用 edgelite.py，消除双路径冲突
+
+        logger.info("Device created: %s (%s)", config.id, config.name)
+        info = self._get_device_info(instance)
+        server = self._protocol_servers.get(config.protocol)
+        if not server or server.status != ProtocolStatus.RUNNING:
+            info.protocol_active = False
+        else:
+            info.protocol_active = True
+        return info
+
+    async def remove_device(self, device_id: str, persist: bool = True) -> None:
+        async with self._devices_lock:  # FIXED: S7 - protect _devices dict access
+            instance = self._devices.pop(device_id, None)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+
+        server = self._protocol_servers.get(instance.protocol)
+        if server and server.status == ProtocolStatus.RUNNING:
+            try:
+                await server.remove_device(device_id)
+            except Exception as e:
+                logger.warning("Failed to remove device %s from protocol server: %s", device_id, e)
+
+        try:
+            instance.stop()
+        except Exception as e:
+            logger.warning("Failed to stop device %s during removal: %s", device_id, e)
+
+        # EdgeLite 删除已由 IntegrationManager 通过 EventBus 事件自动处理
+        # 不再在此处直接调用 edgelite.py，消除双路径冲突
+
+        # FIXED: 删除设备时同时删除数据库记录，保持一致性
+        if persist:
+            try:
+                from protoforge.engine.registry import get_database
+                db = get_database()
+                if db is not None:
+                    await db.delete_device(device_id)
+                    logger.debug("Device %s removed from database", device_id)
+            except Exception as db_err:
+                # 数据库删除失败不影响内存中的删除操作，只记录警告
+                logger.warning("Failed to remove device %s from database: %s (device removed from memory)", device_id, db_err)
+
+        if self._event_bus:
+            await self._event_bus.publish_safe(DeviceRemovedEvent(device_id=device_id))
+
+        logger.info("Device removed: %s", device_id)
+
+    async def update_device(self, device_id: str, config: DeviceConfig) -> DeviceInfo:
+        async with self._devices_lock:
+            instance = self._devices.get(device_id)
+            if not instance:
+                raise ValueError(f"Device not found: {device_id}")
+            old_config = instance.config
+
+        config.id = device_id
+
+        # ── 热更新路径：协议不变时，优先就地更新 ──
+        if config.protocol == old_config.protocol:
+            points_unchanged = (
+                len(config.points) == len(old_config.points)
+                and all(
+                    p1.name == p2.name and p1.address == p2.address and p1.data_type == p2.data_type
+                    for p1, p2 in zip(config.points, old_config.points, strict=False)
+                )
+            )
+            if points_unchanged:
+                # 情况 A：仅 protocol_config 和可变点位参数变更
+                instance.config = config
+                for new_point in config.points:
+                    instance._point_configs[new_point.name] = new_point
+                server = self._protocol_servers.get(config.protocol)
+                if server:
+                    # FIXED-P0: 必须走协议服务器标准接口重建内部映射（从站数据区/IOA 点表/behavior），
+                    # 直接改 _device_configs 会让第三方客户端按新配置轮询时读到旧点表，
+                    # 表现为"编辑设备后客户端连线中断/读数不对"
+                    await self._resync_protocol_device(server, device_id, config, old_config, instance)
+                logger.info("Device %s hot-updated (protocol_config only)", device_id)
+                info = self._get_device_info(instance)
+                info.protocol_active = bool(server and server.status == ProtocolStatus.RUNNING)
+                return info
+            else:
+                # 情况 B：同协议但点位增删
+                old_point_names = {p.name for p in old_config.points}
+                new_point_names = {p.name for p in config.points}
+                added = new_point_names - old_point_names
+                removed = old_point_names - new_point_names
+                instance.config = config
+                for new_point in config.points:
+                    instance._point_configs[new_point.name] = new_point
+                    if new_point.name not in instance._point_values:
+                        instance._point_values[new_point.name] = (
+                            new_point.fixed_value if new_point.fixed_value is not None
+                            else self._generator.generate(new_point)
+                        )
+                for rm_name in removed:
+                    instance._point_configs.pop(rm_name, None)
+                    instance._point_values.pop(rm_name, None)
+                server = self._protocol_servers.get(config.protocol)
+                if server:
+                    # FIXED-P0: 必须走协议服务器标准接口重建内部映射（从站数据区/IOA 点表/behavior），
+                    # 直接改 _device_configs 会让第三方客户端按新配置轮询时读到旧点表，
+                    # 表现为"编辑设备后客户端连线中断/读数不对"
+                    await self._resync_protocol_device(server, device_id, config, old_config, instance)
+                logger.info("Device %s hot-updated (points changed: +%d -%d)", device_id, len(added), len(removed))
+                info = self._get_device_info(instance)
+                info.protocol_active = bool(server and server.status == ProtocolStatus.RUNNING)
+                return info
+
+        # ── 全量重建路径：协议变更时 ──
+        was_running = instance.status == DeviceStatus.ONLINE
+        if was_running:
+            try:
+                await self.stop_device(device_id)
+            except Exception as e:
+                logger.warning("Failed to stop device %s before update: %s", device_id, e)
+
+        try:
+            await self.remove_device(device_id)
+        except Exception as e:
+            logger.exception("Failed to remove old device %s during update: %s, attempting to continue", device_id, e)
+            # FIXED-H06: remove失败不直接raise，继续尝试创建新设备，避免设备丢失
+        try:
+            result = await self.create_device(config)
+            if was_running:
+                try:
+                    await self.start_device(device_id)
+                except Exception as e:
+                    logger.warning("Failed to restart device %s after update: %s", device_id, e)
+            return result
+        except Exception as e:
+            logger.exception("Failed to create new device %s during update: %s, restoring old", device_id, e)
+            try:
+                await self.create_device(old_config)
+                if was_running:
+                    try:
+                        await self.start_device(device_id)
+                    except Exception as restart_err:
+                        logger.warning("Failed to restart restored device %s: %s", device_id, restart_err)
+            except Exception as restore_err:
+                logger.critical("Failed to restore old device %s: %s. Device may be lost!", device_id, restore_err)
+            raise
+
+    async def _resync_protocol_device(
+        self,
+        server: ProtocolServer,
+        device_id: str,
+        new_config: DeviceConfig,
+        old_config: DeviceConfig | None,
+        instance,
+    ) -> None:
+        """热更新后将设备同步到协议服务器：重建内部映射，不断开客户端连接。
+
+        必须走协议服务器的 remove_device + create_device 标准接口：直接改
+        server._device_configs 不会重建从站数据区/IOA 点表/behavior 等内部映射，
+        第三方客户端按新配置轮询会读到旧点表（非法地址/超时），表现为
+        "编辑设备后客户端连线中断"。这两个接口均为纯内存注册表操作，
+        不触碰监听端口与既有 TCP 连接。
+        """
+        if server.status != ProtocolStatus.RUNNING:
+            return
+        try:
+            await server.remove_device(device_id)
+            await server.create_device(new_config)
+        except Exception as e:
+            # 重建失败时回滚注册旧配置，避免设备从协议服务器丢失
+            logger.exception("Failed to resync device %s to protocol %s", device_id, new_config.protocol)
+            with contextlib.suppress(Exception):
+                await server.remove_device(device_id)
+            if old_config is not None:
+                with contextlib.suppress(Exception):
+                    await server.create_device(old_config)
+            logger.warning("Device %s protocol resync failed (old registration restored)", device_id)
+            _swallowed = None
+            return _swallowed
+        # 把引擎当前值写回协议服务器（重建后的 behavior 从初始值开始）
+        try:
+            for pv in instance.read_all_points():
+                with contextlib.suppress(Exception):
+                    await server.write_point(device_id, pv.name, pv.value)
+        except Exception as e:
+            logger.warning("Failed to write current values after resync for %s: %s", device_id, e)
+
+    def set_point_override(self, device_id: str, point_name: str, value: Any) -> None:
+        """调试 Force：设置/清除测点强制值（value=None 表示释放，恢复生成器输出）。"""
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+        device_overrides = self._point_overrides.setdefault(device_id, {})
+        if value is None:
+            device_overrides.pop(point_name, None)
+            if not device_overrides:
+                self._point_overrides.pop(device_id, None)
+            return
+        instance.force_point_value(point_name, value)  # 立即生效（含存在性校验）
+        device_overrides[point_name] = value
+
+    def get_point_overrides(self, device_id: str) -> dict[str, Any]:
+        """返回设备当前的强制覆盖测点（调试 Force 状态）。"""
+        return dict(self._point_overrides.get(device_id, {}))
+
+    def get_all_point_overrides(self) -> dict[str, dict[str, Any]]:
+        return {dev: dict(pts) for dev, pts in self._point_overrides.items()}
+
+    def get_all_device_ids(self) -> list[str]:
+        return list(self._devices.keys())
+
+    async def start_device(self, device_id: str) -> None:
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+        if instance.status == DeviceStatus.ONLINE:
+            return
+        # FIXED: Check if device is already in STARTING state
+        # to prevent double-start which causes ERROR state transition failure
+        from protoforge.engine.state_machine import DeviceState
+        if instance.state_machine.get_state() == DeviceState.STARTING:
+            logger.debug("Device %s already in STARTING state, skipping start", device_id)
+            return
+        if instance.status == DeviceStatus.STARTING:
+            logger.debug("Device %s already starting, skipping", device_id)
+            return
+        if instance.status == DeviceStatus.ERROR:
+            instance.stop()
+        try:
+            instance.start()
+        except Exception as e:
+            logger.exception("Failed to start device %s: %s", device_id, e)
+            raise
+        server = self._protocol_servers.get(instance.protocol)
+        if server:
+            if server.status != ProtocolStatus.RUNNING:
+                # FIXED: 设备启动时如果协议未运行，自动启动协议
+                try:
+                    protocol_config = dict(instance.config.protocol_config)
+                    logger.info("Auto-starting protocol %s for device %s", instance.protocol, device_id)
+                    await self.start_protocol(instance.protocol, protocol_config)
+                except Exception as proto_err:
+                    logger.warning("Failed to auto-start protocol %s: %s", instance.protocol, proto_err)
+            if server.status == ProtocolStatus.RUNNING:
+                try:
+                    await server.create_device(instance.config)
+                except Exception as e:
+                    logger.warning("Failed to sync device %s to protocol server: %s", device_id, e)
+
+        if self._event_bus:
+            await self._event_bus.publish_safe(DeviceStartedEvent(device_id=device_id))
+
+        logger.info("Device started: %s", device_id)
+
+    async def stop_device(self, device_id: str) -> None:
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+        if instance.status == DeviceStatus.OFFLINE:
+            return
+        try:
+            instance.stop()
+        except Exception as e:
+            logger.exception("Failed to stop device %s: %s", device_id, e)
+        server = self._protocol_servers.get(instance.protocol)
+        if server and server.status == ProtocolStatus.RUNNING:
+            try:
+                await server.remove_device(device_id)
+            except Exception as e:
+                logger.warning("Failed to remove device %s from protocol server: %s", device_id, e)
+
+        if self._event_bus:
+            await self._event_bus.publish_safe(DeviceStoppedEvent(device_id=device_id))
+
+        logger.info("Device stopped: %s", device_id)
+
+    def get_device(self, device_id: str) -> DeviceInfo:
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+        return self._get_device_info(instance)
+
+    def get_device_instance(self, device_id: str) -> DeviceInstance | None:
+        return self._devices.get(device_id)
+
+    def get_protocol_server(self, protocol_name: str) -> ProtocolServer | None:
+        """获取协议服务器实例。"""
+        return self._protocol_servers.get(protocol_name)
+
+    def get_all_device_instances(self) -> dict[str, DeviceInstance]:
+        return dict(self._devices)
+
+    def get_scenario_config(self, scenario_id: str) -> ScenarioConfig | None:
+        return self._scenarios.get(scenario_id)
+
+    def get_all_scenario_configs(self) -> dict[str, ScenarioConfig]:
+        return dict(self._scenarios)
+
+    def get_scenario_status(self, scenario_id: str) -> ScenarioStatus:
+        return self._scenario_status.get(scenario_id, ScenarioStatus.STOPPED)
+
+    def get_all_protocol_servers(self) -> dict[str, ProtocolServer]:
+        return dict(self._protocol_servers)
+
+    def get_protocol_running_port(self, protocol_name: str) -> int | str | None:
+        server = self._protocol_servers.get(protocol_name)
+        if server and server.status == ProtocolStatus.RUNNING:
+            return server.get_running_port()
+        return None
+
+    def list_devices(self, protocol: str | None = None) -> list[DeviceInfo]:
+        result = []
+        for instance in list(self._devices.values()):  # FIXED-L05: 使用list()快照避免并发修改
+            if protocol and instance.protocol != protocol:
+                continue
+            result.append(self._get_device_info(instance))
+        return result
+
+    async def read_device_points(self, device_id: str) -> list[PointValue]:
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+
+        # 网络仿真: 延迟
+        await self._network_sim.delay()
+        # 网络仿真: 丢包 -> 回退到内存值
+        if self._network_sim.should_drop():
+            memory_points = instance.read_all_points()
+            for p in memory_points:
+                p.simulated = True
+            return memory_points
+
+        server = self._protocol_servers.get(instance.protocol)
+        if server and server.status == ProtocolStatus.RUNNING:
+            try:
+                proto_points = await server.read_points(device_id)
+                if proto_points:
+                    proto_map = {p.name: p for p in proto_points}
+                    memory_points = instance.read_all_points()
+                    merged = []
+                    for mp in memory_points:
+                        if mp.name in proto_map:
+                            merged.append(proto_map[mp.name])
+                        else:
+                            merged.append(mp)
+                    return merged
+            except Exception as e:
+                logger.warning(
+                    "Failed to read points from protocol server for %s, falling back to memory: %s",
+                    device_id, e,
+                )
+        memory_points = instance.read_all_points()
+        for p in memory_points:
+            p.simulated = True
+        return memory_points
+
+    async def write_device_point(self, device_id: str, point_name: str, value: Any) -> bool:
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+
+        # 网络仿真: 延迟
+        await self._network_sim.delay()
+        # 网络仿真: 丢包 -> 写入失败
+        if self._network_sim.should_drop():
+            logger.debug("Write to %s/%s dropped by network simulator", device_id, point_name)
+            return False
+
+        server = self._protocol_servers.get(instance.protocol)
+        if server and server.status == ProtocolStatus.RUNNING:
+            # 协议 server 运行中：通过 server.write_point() 统一写入，
+            # server.write_point() 内部会通过 on_write 回调传播到 DeviceInstance，
+            # 避免双重写入。
+            try:
+                proto_success = await server.write_point(device_id, point_name, value)
+                if not proto_success:
+                    logger.warning("Protocol write failed for %s/%s", device_id, point_name)
+                    return False
+            except Exception as e:
+                logger.warning("Protocol write error for %s/%s: %s", device_id, point_name, e)
+                _swallowed = False
+                return _swallowed
+        else:
+            # 协议 server 未运行：直接写入 DeviceInstance 内存
+            # FIXED: 添加 try-except 保护，防止 instance.write_point() 抛出异常导致 500
+            try:
+                success = await instance.write_point(point_name, value)
+            except Exception as e:
+                logger.warning("Instance write error for %s/%s: %s", device_id, point_name, e)
+                _swallowed = False
+                return _swallowed
+            if success:
+                logger.warning(
+                    "Write to device %s/%s succeeded in memory, but protocol %s is not running - change not visible to external clients",
+                    device_id, point_name, instance.protocol,
+                )
+            return success
+        return True
+
+    async def create_scenario(self, config: ScenarioConfig) -> ScenarioInfo:  # FIXED-P1: 改为async以支持锁
+        _validate_entity_id(config.id, "Scenario")
+        async with self._scenarios_lock:
+            self._scenarios[config.id] = config
+            self._scenario_status[config.id] = ScenarioStatus.STOPPED
+        logger.info("Scenario created: %s", config.id)
+        return ScenarioInfo(
+            id=config.id,
+            name=config.name,
+            description=config.description,
+            status=ScenarioStatus.STOPPED,
+            device_count=len(config.devices),
+            rule_count=len(config.rules),
+        )
+
+    async def remove_scenario(self, scenario_id: str) -> None:  # FIXED-P1: 改为async以支持锁
+        async with self._scenarios_lock:
+            if scenario_id not in self._scenarios:
+                raise ValueError(f"Scenario not found: {scenario_id}")
+            status = self._scenario_status.get(scenario_id)
+            if status in (ScenarioStatus.RUNNING, ScenarioStatus.STARTING):
+                raise ValueError("Cannot delete a running or starting scenario, stop it first")
+            del self._scenarios[scenario_id]
+            self._scenario_status.pop(scenario_id, None)
+        logger.info("Scenario removed: %s", scenario_id)
+
+    async def update_scenario(self, scenario_id: str, config: ScenarioConfig) -> ScenarioInfo:  # FIXED-P1: 改为async以支持锁
+        async with self._scenarios_lock:
+            if scenario_id not in self._scenarios:
+                raise ValueError(f"Scenario not found: {scenario_id}")
+            current_status = self._scenario_status.get(scenario_id, ScenarioStatus.STOPPED)
+            if current_status in (ScenarioStatus.RUNNING, ScenarioStatus.STARTING):
+                raise ValueError("Cannot update a running or starting scenario, stop it first")
+            config.id = scenario_id
+            self._scenarios[scenario_id] = config
+            instance = self._scenario_instances.get(scenario_id)
+            if instance and hasattr(instance, 'config'):
+                instance.config = config
+        logger.info("Scenario updated: %s", scenario_id)
+        status = self._scenario_status.get(scenario_id, ScenarioStatus.STOPPED)
+        return ScenarioInfo(
+            id=config.id,
+            name=config.name,
+            description=config.description,
+            status=status,
+            device_count=len(config.devices),
+            rule_count=len(config.rules),
+        )
+
+    async def start_scenario(self, scenario_id: str) -> None:
+        async with self._scenarios_lock:  # FIXED-P1: 保护场景状态并发访问
+            config = self._scenarios.get(scenario_id)
+            if not config:
+                raise ValueError(f"Scenario not found: {scenario_id}")
+            self._scenario_status[scenario_id] = ScenarioStatus.STARTING
+        created_device_ids: list[str] = []
+
+        try:
+            failed_devices = []
+            for device_config in config.devices:
+                if device_config.id not in self._devices:
+                    try:
+                        await self.create_device(device_config)
+                        created_device_ids.append(device_config.id)
+                    except Exception as e:
+                        logger.warning("Failed to create device %s in scenario: %s", device_config.id, e)
+                        failed_devices.append(device_config.id)
+
+            for device_config in config.devices:
+                if device_config.id in failed_devices:
+                    continue
+                instance = self._devices.get(device_config.id)
+                if instance:
+                    pass  # device added to scenario below
+
+            # Create scenario instance
+            # 绑定引擎 write_device_point：协同规则写入时立即传播到协议服务器，
+            # 确保上位机/EdgeLite 可见（而非等下一 tick 同步）
+            scenario = Scenario(config, on_write_point=self.write_device_point)
+            for device_config in config.devices:
+                if device_config.id in failed_devices:
+                    continue
+                instance = self._devices.get(device_config.id)
+                if instance:
+                    scenario.add_device(instance)
+                    try:
+                        await self.start_device(device_config.id)
+                    except Exception as e:
+                        logger.warning("Failed to start device %s in scenario: %s", device_config.id, e)
+                        failed_devices.append(device_config.id)
+
+            if failed_devices and len(failed_devices) == len(config.devices):
+                self._scenario_status[scenario_id] = ScenarioStatus.ERROR
+                logger.error("All devices failed in scenario %s", scenario_id)
+                raise RuntimeError(
+                    f"All {len(config.devices)} devices failed to start in scenario '{scenario_id}'. "
+                    f"Failed device IDs: {failed_devices}"
+                )
+
+            if failed_devices:
+                logger.warning(
+                    "Scenario %s started with %d/%d device failures: %s",
+                    scenario_id, len(failed_devices), len(config.devices), failed_devices
+                )
+
+            scenario.start()
+            async with self._scenarios_lock:  # FIXED-P1: 保护场景状态并发访问
+                self._scenario_status[scenario_id] = ScenarioStatus.RUNNING
+                self._scenario_instances[scenario_id] = scenario
+            logger.info("Scenario started: %s (failed devices: %s)", scenario_id, failed_devices or "none")
+        except Exception as e:
+            async with self._scenarios_lock:  # FIXED-P1: 保护场景状态并发访问
+                self._scenario_status[scenario_id] = ScenarioStatus.ERROR
+            for dev_id in created_device_ids:
+                try:
+                    await self.remove_device(dev_id)
+                    logger.info("Rolled back device %s after scenario start failure", dev_id)
+                except Exception as rollback_err:
+                    logger.warning("Failed to rollback device %s: %s", dev_id, rollback_err)
+            logger.exception("Failed to start scenario %s: %s", scenario_id, e)
+            raise
+
+    async def stop_scenario(self, scenario_id: str) -> None:
+        async with self._scenarios_lock:  # FIXED-P1: 保护场景状态并发访问
+            config = self._scenarios.get(scenario_id)
+            if not config:
+                raise ValueError(f"Scenario not found: {scenario_id}")
+            scenario = self._scenario_instances.pop(scenario_id, None)
+            self._scenario_status[scenario_id] = ScenarioStatus.STOPPED
+        if scenario:
+            scenario.stop()
+
+        for device_config in config.devices:
+            try:
+                await self.stop_device(device_config.id)
+            except Exception as e:
+                logger.warning("Failed to stop device %s in scenario: %s", device_config.id, e)
+
+        logger.info("Scenario stopped: %s", scenario_id)
+
+    def list_scenarios(self) -> list[ScenarioInfo]:
+        result = []
+        for sid, config in self._scenarios.items():
+            status = self._scenario_status.get(sid, ScenarioStatus.STOPPED)
+            result.append(
+                ScenarioInfo(
+                    id=config.id,
+                    name=config.name,
+                    description=config.description,
+                    status=status,
+                    device_count=len(config.devices),
+                    rule_count=len(config.rules),
+                )
+            )
+        return result
+
+    def get_scenario(self, scenario_id: str) -> ScenarioDetail:
+        config = self._scenarios.get(scenario_id)
+        if not config:
+            raise ValueError(f"Scenario not found: {scenario_id}")
+        status = self._scenario_status.get(scenario_id, ScenarioStatus.STOPPED)
+        return ScenarioDetail(
+            id=config.id,
+            name=config.name,
+            description=config.description,
+            status=status,
+            device_count=len(config.devices),
+            rule_count=len(config.rules),
+            devices=config.devices,
+            rules=config.rules,
+        )
+
+    async def start(self) -> None:
+        if self._tick_task and not self._tick_task.done():
+            logger.warning("Engine already running, cancelling old tick task")
+            self._tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tick_task
+        self._running = True
+        self._tick_task = asyncio.create_task(self._tick_loop())
+        logger.info("Simulation engine started")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._tick_task:
+            self._tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tick_task
+        for server in self._protocol_servers.values():
+            if server.status == ProtocolStatus.RUNNING:
+                try:
+                    await asyncio.wait_for(server.stop(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout stopping protocol server %s (10s), skipping", server.protocol_name)
+                except Exception as e:
+                    logger.warning("Error stopping protocol server %s: %s", server.protocol_name, e)
+        for instance in self._devices.values():
+            try:
+                instance.stop()
+            except Exception as e:
+                logger.warning("Error stopping device %s: %s", instance.id, e)
+        logger.info("Simulation engine stopped")
+        self._devices.clear()  # FIXED: stop后清理字典，避免重启时状态残留
+        self._scenarios.clear()
+        self._protocol_servers.clear()
+
+    async def _tick_loop(self) -> None:
+        while self._running:
+            tick_started = time.perf_counter()
+            async with self._devices_lock:  # FIXED: S7 - snapshot devices under lock
+                devices_snapshot = list(self._devices.values())
+            shard_counter = 0
+            shard_size = max(0, int(getattr(self, "tick_shard_size", 0) or 0))
+            for instance in devices_snapshot:
+                # v1.11.0 分片让出：批次边界 sleep(0) 交还事件循环（行为等价）
+                shard_counter += 1
+                if shard_size and shard_counter % shard_size == 0:
+                    await asyncio.sleep(0)
+                try:
+                    await instance.tick()
+                    # 调试 Force：每 tick 把强制覆盖的测点重新钉回固定值（压过生成器）
+                    overrides = self._point_overrides.get(instance.id)
+                    if overrides:
+                        for p_name, p_val in overrides.items():
+                            with contextlib.suppress(Exception):
+                                instance.force_point_value(p_name, p_val)
+                    # FIXED-P0: tick后将动态值同步到协议服务器，否则上位机读到的是创建时的静态值
+                    # FIXED: 使用 sync_point_value 替代 write_point，绕过访问控制检查，
+                    # 避免将值写入 _written_values 导致生成器冻结
+                    server = self._protocol_servers.get(instance.protocol)
+                    # 测点级生成周期：只同步本 tick 实际重新生成的测点，
+                    # 未到期测点保持旧值（无论协议服务器是否在运行都要消费，避免集合无限增长）
+                    updated_points = instance.consume_updated_points()
+                    if server and server.status == ProtocolStatus.RUNNING:
+                        for pv in instance.read_all_points():
+                            point_cfg = instance.get_point_config(pv.name)  # FIXED-M07: 使用公开方法而非直接访问私有属性
+                            if point_cfg and point_cfg.generator_type != GeneratorType.FIXED:
+                                # 测点级生成周期：未到生成周期的测点本 tick 未变化，跳过同步
+                                if pv.name not in updated_points:
+                                    continue
+                                # FIX: 定时冻结 — 跳过仍在冻结期的点位，冻结到期后自动恢复同步
+                                if pv.name in instance._written_points:
+                                    continue
+                                # 冻结刚到期：清除 behavior._written_values 以解冻协议层 get_value()
+                                behavior = getattr(server, '_behaviors', {}).get(instance.id)
+                                if behavior and hasattr(behavior, '_written_values') and pv.name in behavior._written_values:
+                                    behavior.clear_written(pv.name)
+                                try:
+                                    await server.sync_point_value(instance.id, pv.name, pv.value)
+                                except Exception as sync_err:
+                                    logger.debug("同步点位值到协议服务器失败 (device=%s, point=%s): %s", instance.id, pv.name, sync_err)
+                except Exception as e:
+                    logger.warning("Tick error for device %s: %s", instance.id, e)
+            # v1.11.0 tick 时长观测
+            _tick_ms = (time.perf_counter() - tick_started) * 1000
+            _ts = self.tick_stats
+            _ts["tick_count"] = _ts.get("tick_count", 0.0) + 1
+            _n = _ts["tick_count"]
+            _ts["tick_avg_ms"] = round((_ts.get("tick_avg_ms", 0.0) * (_n - 1) + _tick_ms) / _n, 3)
+            _ts["tick_max_ms"] = round(max(_ts.get("tick_max_ms", 0.0), _tick_ms), 3)
+
+            for scenario in list(self._scenario_instances.values()):
+                try:
+                    await scenario.tick()
+                except Exception as e:
+                    logger.warning("Tick error for scenario %s: %s", getattr(scenario.config, 'id', 'unknown') if scenario.config else 'unknown', e)
+            # 处理故障传播
+            try:
+                for inst in devices_snapshot:
+                    dev_id = inst.id
+                    point_values = inst.get_point_values_snapshot()
+                    triggers = self._fault_propagation.check_propagation(point_values)
+                    for trigger in triggers:
+                        from protoforge.simulation.fault_injection import FaultConfig, FaultType, TriggerMode
+                        ft = trigger.get("fault_type", FaultType.SENSOR_NOISE)
+                        if isinstance(ft, str):
+                            ft = FaultType(ft)
+                        config = FaultConfig(
+                            fault_type=ft,
+                            target_point=trigger.get("target", "*"),
+                            trigger_mode=TriggerMode.MANUAL,
+                            parameters=trigger.get("parameters", {}),
+                            target_device=dev_id,
+                            start_time=trigger.get("start_time"),
+                            probability=0.0,
+                            description=f'Propagated fault: {ft.value}',
+                        )
+                        fid = inst.inject_fault(config)
+                        inst.activate_fault(fid)
+            except Exception as e:
+                logger.debug("Fault propagation check error: %s", e)
+
+            await asyncio.sleep(self._tick_interval)
+
+    def _get_device_info(self, instance: DeviceInstance) -> DeviceInfo:
+        return DeviceInfo(
+            id=instance.id,
+            name=instance.name,
+            protocol=instance.protocol,
+            template_id=instance.config.template_id,
+            status=instance.status,
+            points=instance.read_all_points(),
+            protocol_config=instance.config.protocol_config,
+        )
+
+    def get_device_detail(self, device_id: str) -> dict[str, Any]:
+        """返回设备的详细信息，包含状态机、故障和控制回路信息。
+
+        :param device_id: 设备 ID
+        :return: 包含完整设备详情的字典
+        """
+        instance = self._devices.get(device_id)
+        if not instance:
+            raise ValueError(f"Device not found: {device_id}")
+
+        info = self._get_device_info(instance)
+        sm_info = instance.get_state_info()
+        fault_info = instance.get_fault_info()
+        loop_info = instance.get_control_loop_info()
+        return {
+            "id": info.id,
+            "name": info.name,
+            "protocol": info.protocol,
+            "template_id": info.template_id,
+            "status": info.status.value,
+            "protocol_active": info.protocol_active,
+            "points": [
+                {"name": p.name, "value": p.value, "quality": p.quality,
+                 "quality_code": getattr(p, 'quality_code', 0),
+                 "timestamp": p.timestamp, "simulated": getattr(p, 'simulated', False)}
+                for p in info.points
+            ],
+            "state": {
+                "state": sm_info.get("state", "-"),
+                "uptime": f"{sm_info.get('state_duration', 0):.1f}s",
+                "quality": sm_info.get("quality", ""),
+                "available_transitions": sm_info.get("available_transitions", []),
+                "history": instance.get_state_history(20),
+            },
+            "faults": fault_info.get("faults", []),
+            "active_fault_count": fault_info.get("active_count", 0),
+            "control_loops": loop_info.get("loops", []),
+            "network_sim": self._network_sim.to_dict() if self._network_sim else None,
+        }
+
+    @property
+    def fault_propagation(self) -> FaultPropagation:
+        """返回故障传播链管理器。"""
+        return self._fault_propagation
+
+    @property
+    def timeseries_manager(self) -> TimeSeriesManager:
+        """返回时间序列模式管理器。"""
+        return self._timeseries_manager
+
+    @property
+    def network_simulator(self) -> NetworkSimulator:
+        """返回网络仿真器。"""
+        return self._network_sim
+
+    def configure_network(self, profile: str | dict[str, Any], enabled: bool = True) -> None:
+        """配置网络仿真参数。
+
+        :param profile: 预定义名称 ("ideal"/"lan"/"wan"/...) 或配置字典
+        :param enabled: 是否启用
+        """
+        from protoforge.engine.network_sim import NetworkProfile
+        if isinstance(profile, str):
+            self._network_sim.set_profile(profile)
+        elif isinstance(profile, dict):
+            self._network_sim.set_profile(NetworkProfile.from_dict(profile))
+        self._network_sim.enable() if enabled else self._network_sim.disable()
+        logger.info("Network simulation configured: profile=%s, enabled=%s", profile, enabled)

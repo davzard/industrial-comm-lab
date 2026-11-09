@@ -1,0 +1,1140 @@
+"""MODBUS protocol server implementation."""
+
+import asyncio
+import contextlib
+import logging
+import struct
+import time
+from collections.abc import Callable
+from typing import Any
+
+from protoforge.models.device import DeviceConfig, PointConfig, PointValue, normalize_point_value
+from protoforge.observability.messages import desc, msg  # FIXED: i18n消息常量
+from protoforge.protocols.base import (
+    ProtocolErrorCategory,
+    ProtocolServer,
+    ProtocolStatus,
+    externally_cancelled,
+    shutdown_server_task,
+)
+from protoforge.protocols.modbus._common import (
+    WRITE_FC_AREA_MAP,
+    ModbusDataStore,
+    ModbusDeviceBehavior,
+    parse_modbus_address,
+    point_area,
+    point_reg_count,
+)
+
+logger = logging.getLogger(__name__)
+
+SIMDATA_AVAILABLE = False
+try:
+    from pymodbus.simulator import DataType, SimData, SimDevice
+    SIMDATA_AVAILABLE = True
+except ImportError:
+    DataType = None  # type: ignore[assignment,misc]
+
+OLD_API_AVAILABLE = False
+try:
+    from pymodbus.datastore import ModbusDeviceContext, ModbusSequentialDataBlock, ModbusServerContext  # noqa: F401
+    OLD_API_AVAILABLE = True
+except ImportError:
+    pass
+
+StartAsyncTcpServer = None  # type: ignore[assignment]
+with contextlib.suppress(ImportError):
+    from pymodbus.server import StartAsyncTcpServer  # type: ignore[assignment]
+
+
+class ModbusTcpServer(ProtocolServer):
+    protocol_name = "modbus_tcp"
+    protocol_display_name = "Modbus TCP"
+
+    _MAX_READ_COILS = 2000  # FIXED-P0: Modbus规范FC01/02最多读2000个位(原值125与_MAX_READ_REGISTERS互反)
+    _MAX_READ_REGISTERS = 125  # FIXED-P0: Modbus规范FC03/04最多读125个寄存器(原值2000与_MAX_READ_COILS互反)
+
+    def __init__(self):
+        super().__init__()
+        self._server_task: asyncio.Task | None = None
+        self._context: Any = None
+        self._behaviors: dict[str, ModbusDeviceBehavior] = {}
+        self._device_configs: dict[str, DeviceConfig] = {}
+        self._host = "0.0.0.0"
+        self._port = 5020
+        self._requested_port = 5020
+        self._slave_map: dict[str, int] = {}
+        self._next_slave_id = 1
+        self._data_stores: dict[int, ModbusDataStore] = {}
+        # FIXED: 始终使用原生帧处理器（_serve_datastore_only），SimData 在服务启动时
+        # 创建不可变快照、不支持动态设备注册，导致初始值全零且外部写入无法反映。
+        # 原生处理器直接读写 _data_stores，与 _apply_device_to_context / _read_register 同源。
+        self._use_simdata = False
+        self._server_running = False  # FIXED-P0: _handle_native_modbus引用此属性但未初始化
+
+    @property
+    def actual_port(self) -> int:
+        """返回协议服务器实际监听的端口"""
+        return self._port
+
+    @property
+    def requested_port(self) -> int:
+        """返回用户配置的端口"""
+        return self._requested_port
+
+    def _on_server_task_done(self, task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception("Modbus TCP server task failed: %s", e)
+            self._status = ProtocolStatus.ERROR
+
+    def _add_slave_to_context(self, slave_id: int, device_context: Any) -> None:
+        if self._context is None:
+            return
+        try:
+            if hasattr(self._context, '__setitem__'):
+                self._context[slave_id] = device_context
+            elif hasattr(self._context, 'slave'):
+                self._context.slave(slave_id, device_context)
+            else:
+                logger.debug("No supported method to add slave %d to context", slave_id)
+        except Exception as e:
+            logger.warning("Failed to add slave %d to context: %s", slave_id, e)
+
+    def _get_data_store(self, slave_id: int) -> ModbusDataStore:
+        if slave_id not in self._data_stores:
+            self._data_stores[slave_id] = ModbusDataStore()
+        return self._data_stores[slave_id]
+
+    def _build_sim_devices(self) -> list[Any]:
+        devices = []
+        all_slave_ids = set(self._slave_map.values())
+        if not all_slave_ids:
+            all_slave_ids = {1}
+
+        self._sim_data_map.clear() if hasattr(self, '_sim_data_map') else None
+        for slave_id in all_slave_ids:
+            store = self._get_data_store(slave_id)
+            # FIXED-M09: 根据实际数据范围动态确定初始化大小，而非硬编码0-99
+            max_coil = max((k for k in store.coils), default=99) + 1
+            max_di = max((k for k in store.discrete_inputs), default=99) + 1
+            max_hr = max((k for k in store.holding_regs), default=99) + 1
+            max_ir = max((k for k in store.input_regs), default=99) + 1
+            simdata = [
+                SimData(1, values=[store.coils.get(i, 0) for i in range(0, max(100, max_coil))], datatype=DataType.BITS),
+                SimData(10001, values=[store.discrete_inputs.get(i, 0) for i in range(0, max(100, max_di))], datatype=DataType.BITS),
+                SimData(40001, values=[store.holding_regs.get(i, 0) for i in range(0, max(100, max_hr))], datatype=DataType.REGISTERS),
+                SimData(30001, values=[store.input_regs.get(i, 0) for i in range(0, max(100, max_ir))], datatype=DataType.REGISTERS),
+            ]
+            devices.append(SimDevice(slave_id, simdata=simdata))
+        return devices
+
+    async def _serve_datastore_only(self) -> None:
+        logger.info("Modbus TCP running in native frame mode (primary path)")
+        try:
+            server = await asyncio.start_server(
+                self._handle_native_modbus, self._host, self._port
+            )
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            logger.debug("Modbus server task cancelled")
+        except Exception as e:
+            logger.exception("Modbus native frame server error: %s", e)
+            self._status = ProtocolStatus.ERROR
+
+    _CONN_TIMEOUT = 30  # FIXED: 首包读取超时秒数，防止Slowloris攻击
+    _IDLE_TIMEOUT = 3600  # FIXED(用户反馈 v1.6.32): 已建立连接的请求间空闲上限（1小时）
+
+    async def _handle_native_modbus(self, reader: asyncio.StreamReader,
+                                     writer: asyncio.StreamWriter) -> None:
+
+        # v1.11.0 连接数上限门
+        if not self._connection_gate(writer):
+            return
+        self.on_client_connect()
+        first_request = True
+        try:
+            while self._server_running:
+                # FIXED(用户实测 v1.6.32): 此前每个请求间的空闲等待都套 30s 超时，扫描周期
+                # 长于 30s 的客户端（如 Kepware 低速扫描）会被周期性断连 —— 采集端表现为
+                # 标签质量周期性 BAD（OPC UA 订阅读到 None），重连后恢复，反复交替。
+                # 现改为：仅首个首包用 30s 防慢速攻击，后续请求空闲上限放宽到 1 小时。
+                timeout = self._CONN_TIMEOUT if first_request else self._IDLE_TIMEOUT
+                header = await asyncio.wait_for(reader.readexactly(7), timeout=timeout)
+                first_request = False
+                tx_id = struct.unpack(">H", header[0:2])[0]
+                proto_id = struct.unpack(">H", header[2:4])[0]
+                if proto_id != 0:  # FIXED-P2: MBAP Protocol ID必须为0(Modbus规范)
+                    continue
+                length = struct.unpack(">H", header[4:6])[0]
+                if length < 1 or length > 253:  # FIXED-N01: MBAP length域范围1-253(Modbus规范)，防止恶意帧导致异常读取
+                    continue
+                unit_id = header[6]
+                if length > 0:
+                    payload = await asyncio.wait_for(reader.readexactly(length - 1), timeout=self._CONN_TIMEOUT)  # FIXED: 添加读取超时
+                else:
+                    payload = b""
+                fc = payload[0] if payload else 0
+                resp = self._process_modbus_frame(unit_id, fc, payload[1:])
+                if resp is None:
+                    continue
+                mbap = struct.pack(">HHHB", tx_id, proto_id, len(resp) + 1, unit_id)
+                writer.write(mbap + resp)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.CancelledError, asyncio.TimeoutError, BrokenPipeError, ConnectionAbortedError):
+            pass
+        except Exception as e:  # FIXED-P1: 兜底捕获所有其他异常，避免单个帧处理错误导致整个连接崩溃
+            self.record_protocol_error(ProtocolErrorCategory.INTERNAL, str(e))
+            logger.exception("Modbus TCP connection handler unexpected error: %s", e)
+        finally:
+            self.on_client_disconnect()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception as e:
+                logger.debug("Modbus TCP writer close error: %s", e)
+
+    # Modbus 异常码
+    _EX_ILLEGAL_FUNCTION = 0x01
+    _EX_ILLEGAL_DATA_ADDRESS = 0x02
+    _EX_ILLEGAL_DATA_VALUE = 0x03
+    _EX_SLAVE_DEVICE_FAILURE = 0x04
+    _EX_ACKNOWLEDGE = 0x05
+    _EX_SLAVE_DEVICE_BUSY = 0x06
+    _EX_GATEWAY_PATH_UNAVAILABLE = 0x0A
+
+    # 设备状态 → Modbus 异常码映射
+    # 设计意图（与真实 PLC 行为一致）：设备处于 stop/starting/stopping 状态时通信模块
+    # 仍会响应 Modbus 请求（返回寄存器最后已知值），这些状态不映射任何异常码。
+    # FIXED-P1: 原先 starting/stopping 映射 0x05(Acknowledge)，导致设备自动拉起后的
+    # STARTING 窗口期内所有读请求都收到异常响应（外部主站读到错误而非数据，
+    # 7 个真实链路 e2e 测试失败），与真实设备行为不符，改为照常应答。
+    # 0x04 (Slave Device Failure) 仅用于真正的硬件故障 (error)。
+    _STATE_EXCEPTION_CODES: dict[str, int] = {
+        "error": 0x04,       # Slave Device Failure (硬件故障)
+        "maintenance": 0x06, # Slave Device Busy (维护中)
+        "program": 0x0A,    # Gateway Path Unavailable (编程模式)
+    }
+
+    _FC_NAMES: dict[int, str] = {
+        0x01: "Read Coils", 0x02: "Read Discrete Inputs",
+        0x03: "Read Holding Registers", 0x04: "Read Input Registers",
+        0x05: "Write Single Coil", 0x06: "Write Single Register",
+        0x0F: "Write Multiple Coils", 0x10: "Write Multiple Registers",
+        0x16: "Mask Write Register", 0x17: "Read/Write Multiple Registers",
+    }
+
+    def _err_response(self, fc: int, code: int) -> bytes:
+        """生成 Modbus 异常响应帧。
+
+        :param fc: 功能码
+        :param code: 异常码 (0x01=非法功能, 0x02=非法地址, 0x03=非法数据值)
+        :return: 异常响应字节
+        """
+        return bytes([fc | 0x80, code])
+
+    def _check_device_state_for_exception(self, slave_id: int) -> int | None:
+        """检查设备状态，返回对应的 Modbus 异常码（如果在非 RUN 状态）。
+
+        :param slave_id: Modbus 从站 ID
+        :return: 异常码 (如 0x04)，或 None (设备在 RUN 状态)
+        """
+        # 反查 device_id
+        device_id = None
+        for did, sid in self._slave_map.items():
+            if sid == slave_id:
+                device_id = did
+                break
+        if device_id is None:
+            return None  # 未知从站，不拦截
+        state_str = self.get_device_state_string(device_id)
+        return self._STATE_EXCEPTION_CODES.get(state_str)
+
+    def _read_bits(
+        self, fc: int, data: bytes, store: ModbusDataStore,
+        getter: Callable[[int], int], max_count: int, slave_id: int, fc_name: str,
+    ) -> bytes:
+        """处理读位操作 (FC01/FC02)。
+
+        :param fc: 功能码 (0x01 或 0x02)
+        :param data: PDU 数据部分
+        :param store: Modbus 数据存储
+        :param getter: 取位值的回调 (get_coil 或 get_discrete_input)
+        :param max_count: 最大读取数量
+        :param slave_id: 从站 ID (用于日志)
+        :param fc_name: 功能码名称 (用于日志)
+        :return: 响应 PDU
+        """
+        if len(data) < 4:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        start = struct.unpack(">H", data[0:2])[0]
+        count = struct.unpack(">H", data[2:4])[0]
+        if count == 0 or count > max_count:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        self._log_debug("inbound", "modbus_read", f"{fc_name}: addr={start} count={count}",
+                        detail={"fc": fc, "start": start, "count": count, "unit": slave_id})
+        byte_count = (count + 7) // 8
+        bits = bytearray(byte_count)
+        for i in range(count):
+            if getter(start + i):
+                bits[i // 8] |= (1 << (i % 8))
+        return bytes([fc, byte_count]) + bytes(bits)
+
+    def _read_regs(
+        self, fc: int, data: bytes, store: ModbusDataStore,
+        area: int, max_count: int, slave_id: int, fc_name: str,
+    ) -> bytes:
+        """处理读寄存器操作 (FC03/FC04)。
+
+        :param fc: 功能码 (0x03 或 0x04)
+        :param data: PDU 数据部分
+        :param store: Modbus 数据存储
+        :param area: 数据区 (3=holding, 4=input)
+        :param max_count: 最大读取数量
+        :param slave_id: 从站 ID (用于日志)
+        :param fc_name: 功能码名称 (用于日志)
+        :return: 响应 PDU
+        """
+        if len(data) < 4:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        start = struct.unpack(">H", data[0:2])[0]
+        count = struct.unpack(">H", data[2:4])[0]
+        if count == 0 or count > max_count:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        self._log_debug("inbound", "modbus_read", f"{fc_name}: addr={start} count={count}",
+                        detail={"fc": fc, "start": start, "count": count, "unit": slave_id})
+        byte_count = count * 2
+        regs = bytearray(byte_count)
+        for i in range(count):
+            val = store.get_point(area, start + i)
+            regs[i * 2:i * 2 + 2] = struct.pack(">H", val & 0xFFFF)
+        return bytes([fc, byte_count]) + bytes(regs)
+
+    def _write_single(
+        self, fc: int, data: bytes, target_stores: list[ModbusDataStore],
+        is_broadcast: bool, slave_id: int, fc_name: str,
+    ) -> bytes | None:
+        """处理写单个操作 (FC05/FC06)。
+
+        :param fc: 功能码 (0x05 或 0x06)
+        :param data: PDU 数据部分
+        :param target_stores: 目标数据存储列表
+        :param is_broadcast: 是否广播请求
+        :param slave_id: 从站 ID (用于日志)
+        :param fc_name: 功能码名称 (用于日志)
+        :return: 响应 PDU 或 None (广播)
+        """
+        if len(data) < 4:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        start = struct.unpack(">H", data[0:2])[0]
+        val = struct.unpack(">H", data[2:4])[0]
+        if fc == 0x05 and val not in (0xFF00, 0x0000):
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        # access 只读校验：外部写命中 access='r' 点位时拒绝（FIXED：只读点位外部可写的语义缺口）
+        readonly_hit = self._check_external_write_access(slave_id, fc, start, 1, all_slaves=is_broadcast)
+        if readonly_hit:
+            return self._reject_readonly_write(fc, slave_id, fc_name, start, readonly_hit, is_broadcast)
+        for s in target_stores:
+            if fc == 0x05:
+                s.set_coil(start, 1 if val == 0xFF00 else 0)
+            else:
+                s.set_point(6, start, val)
+        self._log_debug("inbound", "modbus_write", f"{fc_name}: addr={start} val={val}",
+                        detail={"fc": fc, "start": start, "value": val, "unit": slave_id})
+        # FIXED: 异步通知 _on_write 回调，将外部写入传播到 DeviceInstance（双向写关键）
+        write_val = bool(val == 0xFF00) if fc == 0x05 else val
+        self._notify_external_write(slave_id, fc, start, write_val)
+        return None if is_broadcast else (bytes([fc]) + data[0:4])
+
+    def _write_multiple_coils(
+        self, fc: int, data: bytes, target_stores: list[ModbusDataStore],
+        is_broadcast: bool, slave_id: int, fc_name: str,
+    ) -> bytes | None:
+        """处理写多个线圈 (FC0F)。
+
+        :param fc: 功能码 (0x0F)
+        :param data: PDU 数据部分
+        :param target_stores: 目标数据存储列表
+        :param is_broadcast: 是否广播请求
+        :param slave_id: 从站 ID (用于日志)
+        :param fc_name: 功能码名称 (用于日志)
+        :return: 响应 PDU 或 None (广播)
+        """
+        if len(data) < 5:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        start = struct.unpack(">H", data[0:2])[0]
+        count = struct.unpack(">H", data[2:4])[0]
+        byte_count = data[4]
+        if count == 0 or count > 1968:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        expected_bytes = (count + 7) // 8
+        if byte_count != expected_bytes:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        # access 只读校验（FIXED：只读点位外部可写的语义缺口）
+        readonly_hit = self._check_external_write_access(slave_id, fc, start, count, all_slaves=is_broadcast)
+        if readonly_hit:
+            return self._reject_readonly_write(fc, slave_id, fc_name, start, readonly_hit, is_broadcast)
+        for s in target_stores:
+            for i in range(count):
+                byte_idx = 5 + i // 8
+                bit_idx = i % 8
+                if byte_idx < len(data):
+                    s.set_coil(start + i, 1 if data[byte_idx] & (1 << bit_idx) else 0)
+        self._log_debug("inbound", "modbus_write", f"{fc_name}: addr={start} count={count}",
+                        detail={"fc": fc, "start": start, "count": count, "unit": slave_id})
+        # FIXED: 异步通知 _on_write 回调（逐地址通知，仅通知映射到点位的首个地址）
+        self._notify_external_write(slave_id, fc, start, True)
+        return None if is_broadcast else (bytes([fc]) + data[0:4])
+
+    def _write_multiple_regs(
+        self, fc: int, data: bytes, target_stores: list[ModbusDataStore],
+        is_broadcast: bool, slave_id: int, fc_name: str,
+    ) -> bytes | None:
+        """处理写多个寄存器 (FC10)。
+
+        :param fc: 功能码 (0x10)
+        :param data: PDU 数据部分
+        :param target_stores: 目标数据存储列表
+        :param is_broadcast: 是否广播请求
+        :param slave_id: 从站 ID (用于日志)
+        :param fc_name: 功能码名称 (用于日志)
+        :return: 响应 PDU 或 None (广播)
+        """
+        if len(data) < 5:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        start = struct.unpack(">H", data[0:2])[0]
+        count = struct.unpack(">H", data[2:4])[0]
+        byte_count = data[4]
+        if count == 0 or count > 123:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        if byte_count != count * 2:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        # access 只读校验（FIXED：只读点位外部可写的语义缺口）
+        readonly_hit = self._check_external_write_access(slave_id, fc, start, count, all_slaves=is_broadcast)
+        if readonly_hit:
+            return self._reject_readonly_write(fc, slave_id, fc_name, start, readonly_hit, is_broadcast)
+        for s in target_stores:
+            for i in range(count):
+                offset = 5 + i * 2
+                if offset + 2 <= len(data):
+                    val = struct.unpack(">H", data[offset:offset + 2])[0]
+                    s.set_point(16, start + i, val)
+        self._log_debug("inbound", "modbus_write", f"{fc_name}: addr={start} count={count}",
+                        detail={"fc": fc, "start": start, "count": count, "unit": slave_id})
+        # FIXED: 异步通知 _on_write 回调（通知起始地址，值由 DeviceInstance 从 store 读取）
+        self._notify_external_write(slave_id, fc, start, None)
+        return None if is_broadcast else (bytes([fc]) + data[0:4])
+
+    def _mask_write_reg(
+        self, fc: int, data: bytes, target_stores: list[ModbusDataStore],
+        is_broadcast: bool, slave_id: int,
+    ) -> bytes | None:
+        """处理掩码写寄存器 (FC16)。
+
+        :param fc: 功能码 (0x16)
+        :param data: PDU 数据部分
+        :param target_stores: 目标数据存储列表
+        :param is_broadcast: 是否广播请求
+        :param slave_id: 从站 ID (用于日志)
+        :return: 响应 PDU 或 None (广播)
+        """
+        if len(data) < 6:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        addr = struct.unpack(">H", data[0:2])[0]
+        and_mask = struct.unpack(">H", data[2:4])[0]
+        or_mask = struct.unpack(">H", data[4:6])[0]
+        # access 只读校验（FIXED：只读点位外部可写的语义缺口）
+        readonly_hit = self._check_external_write_access(slave_id, fc, addr, 1, all_slaves=is_broadcast)
+        if readonly_hit:
+            return self._reject_readonly_write(fc, slave_id, "Mask Write Register", addr, readonly_hit, is_broadcast)
+        for s in target_stores:
+            current = s.get_point(3, addr)
+            new_val = (current & and_mask) | (or_mask & ~and_mask)
+            new_val &= 0xFFFF
+            s.set_point(6, addr, new_val)
+        self._log_debug("inbound", "modbus_write",
+                        f"MaskWrite: addr={addr} and={and_mask:#06x} or={or_mask:#06x}",
+                        detail={"fc": fc, "addr": addr, "unit": slave_id})
+        # FIXED: 异步通知 _on_write 回调
+        self._notify_external_write(slave_id, fc, addr, new_val)
+        return None if is_broadcast else (bytes([fc]) + data[0:6])
+
+    def _read_write_multiple(
+        self, fc: int, data: bytes, store: ModbusDataStore,
+        target_stores: list[ModbusDataStore], is_broadcast: bool, slave_id: int,
+    ) -> bytes | None:
+        """处理读写多个寄存器 (FC17)。
+
+        :param fc: 功能码 (0x17)
+        :param data: PDU 数据部分
+        :param store: 主数据存储 (用于读取)
+        :param target_stores: 目标数据存储列表 (用于写入)
+        :param is_broadcast: 是否广播请求
+        :param slave_id: 从站 ID (用于日志)
+        :return: 响应 PDU 或 None (广播)
+        """
+        if len(data) < 9:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        r_start = struct.unpack(">H", data[0:2])[0]
+        r_count = struct.unpack(">H", data[2:4])[0]
+        w_start = struct.unpack(">H", data[4:6])[0]
+        w_count = struct.unpack(">H", data[6:8])[0]
+        if r_count == 0 or r_count > self._MAX_READ_REGISTERS or w_count == 0 or w_count > 121:
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_VALUE)
+        # access 只读校验：FC17 写入部分同样不允许命中只读点位（FIXED：语义缺口）
+        readonly_hit = self._check_external_write_access(slave_id, fc, w_start, w_count, all_slaves=is_broadcast)
+        if readonly_hit:
+            return self._reject_readonly_write(fc, slave_id, "Read/Write Multiple Registers", w_start, readonly_hit, is_broadcast)
+        for s in target_stores:
+            for i in range(w_count):
+                offset = 9 + i * 2
+                if offset + 2 <= len(data):
+                    val = struct.unpack(">H", data[offset:offset + 2])[0]
+                    s.set_point(6, w_start + i, val)
+        # FIXED: 异步通知 _on_write 回调
+        self._notify_external_write(slave_id, fc, w_start, None)
+        if is_broadcast:
+            return None
+        r_byte_count = r_count * 2
+        regs = bytearray(r_byte_count)
+        for i in range(r_count):
+            val = store.get_point(3, r_start + i)
+            regs[i * 2:i * 2 + 2] = struct.pack(">H", val & 0xFFFF)
+        self._log_debug("inbound", "modbus_rw",
+                        f"ReadWriteMultiple: r={r_start}/{r_count} w={w_start}/{w_count}",
+                        detail={"fc": fc, "r_start": r_start, "w_start": w_start, "unit": slave_id})
+        return bytes([fc, r_byte_count]) + bytes(regs)
+
+    def _process_modbus_frame(self, unit_id: int, fc: int, data: bytes) -> bytes | None:
+        """处理 Modbus PDU 帧，根据功能码分派到对应处理器。
+
+        支持 FC01-FC06, FC0F, FC10, FC16, FC17 共 10 种功能码。
+        广播请求 (unit_id=0) 对读操作不返回响应，对写操作遍历所有从站。
+
+        :param unit_id: MBAP Unit ID (0=广播, 1-247=从站)
+        :param fc: 功能码
+        :param data: PDU 数据部分 (不含功能码)
+        :return: 响应 PDU 字节，或 None (广播/无需响应)
+        """
+        is_broadcast = (unit_id == 0)
+        slave_id = unit_id if unit_id else 1
+        fc_name = self._FC_NAMES.get(fc, f"FC{fc:02X}")
+
+        # 广播读操作不返回响应
+        if is_broadcast and fc in (0x01, 0x02, 0x03, 0x04):
+            return None
+
+        # 设备状态检查：非 RUN 状态返回异常码
+        if not is_broadcast:
+            exc_code = self._check_device_state_for_exception(slave_id)
+            if exc_code is not None:
+                return self._err_response(fc, exc_code)
+
+        # 广播写入时遍历所有从站
+        target_stores = list(self._data_stores.values()) if is_broadcast else [self._get_data_store(slave_id)]
+        if not target_stores:
+            return None
+        store = target_stores[0]
+
+        try:
+            if fc == 0x01:
+                return self._read_bits(fc, data, store, store.get_coil, self._MAX_READ_COILS, slave_id, fc_name)
+            elif fc == 0x02:
+                return self._read_bits(fc, data, store, store.get_discrete_input, self._MAX_READ_COILS, slave_id, fc_name)
+            elif fc == 0x03:
+                return self._read_regs(fc, data, store, 3, self._MAX_READ_REGISTERS, slave_id, fc_name)
+            elif fc == 0x04:
+                return self._read_regs(fc, data, store, 4, self._MAX_READ_REGISTERS, slave_id, fc_name)
+            elif fc in (0x05, 0x06):
+                return self._write_single(fc, data, target_stores, is_broadcast, slave_id, fc_name)
+            elif fc == 0x0F:
+                return self._write_multiple_coils(fc, data, target_stores, is_broadcast, slave_id, fc_name)
+            elif fc == 0x10:
+                return self._write_multiple_regs(fc, data, target_stores, is_broadcast, slave_id, fc_name)
+            elif fc == 0x16:
+                return self._mask_write_reg(fc, data, target_stores, is_broadcast, slave_id)
+            elif fc == 0x17:
+                return self._read_write_multiple(fc, data, store, target_stores, is_broadcast, slave_id)
+            else:
+                return self._err_response(fc, self._EX_ILLEGAL_FUNCTION)
+        except (IndexError, struct.error):
+            return self._err_response(fc, self._EX_ILLEGAL_DATA_ADDRESS)
+
+    async def start(self, config: dict[str, Any]) -> None:
+        self._status = ProtocolStatus.STARTING
+        self._apply_connection_limit(config)
+        self._host = config.get("host", "0.0.0.0")
+        self._requested_port = config.get("port", 5020)
+        self._validate_port(self._requested_port)
+        self._port = self._requested_port
+
+        if not StartAsyncTcpServer:
+            raise RuntimeError("pymodbus is not installed. Install with: pip install pymodbus")
+
+        try:
+            self._server_running = True  # FIXED-P0: native模式需要此标志
+            # FIXED: 始终使用原生帧处理器——完整实现 FC01-FC17，直接读写 _data_stores，
+            # 支持动态设备注册（设备注册后 _apply_device_to_context 写 store，原生处理器立即可读）。
+            # SimData 在启动时创建不可变快照、OldAPI 限制 100 寄存器，均不适合生产场景。
+            self._server_task = asyncio.create_task(
+                self._serve_datastore_only()
+            )
+
+            if self._server_task:
+                self._server_task.add_done_callback(self._on_server_task_done)
+
+            self._status = ProtocolStatus.RUNNING
+            logger.info("Modbus TCP server starting on %s:%d (native frame handler)", self._host, self._port)
+            self._log_debug("system", "server_start",
+                            msg("modbus_tcp", "service_started", host=self._host, port=self._port),  # FIXED: 中文硬编码→i18n常量
+                            detail={"host": self._host, "port": self._port, "mode": "native"})
+        except Exception as e:
+            self._status = ProtocolStatus.ERROR
+            logger.exception("Failed to start Modbus TCP server: %s", e)
+            raise
+
+    async def stop(self) -> None:
+        self._server_running = False  # FIXED-P0: 停止native模式循环
+        try:
+            if self._server_task:
+                self._server_task.cancel()
+                try:
+                    await self._server_task
+                except asyncio.CancelledError:
+                    logger.debug("Modbus TCP task cancelled")
+                    if externally_cancelled():
+                        raise
+                except Exception as e:
+                    logger.warning("Modbus TCP server task error: %s", e)
+        except Exception as e:
+            logger.warning("Modbus TCP server stop error: %s", e)
+        finally:
+            self._status = ProtocolStatus.STOPPED
+            logger.info("Modbus TCP server stopped")
+            self._log_debug("system", "server_stop", msg("modbus_tcp", "service_stopped"))  # FIXED: 中文硬编码→i18n常量
+
+    def _normalize_point_ranges(self, config: DeviceConfig) -> list[tuple[str, int, int, str]]:
+        """归一化设备点位为 (区域, 起始地址, 结束地址, 点位名) 列表（用于从站地址冲突检测）。"""
+        ranges: list[tuple[str, int, int, str]] = []
+        for point in config.points:
+            try:
+                addr, area = parse_modbus_address(point.address)
+            except (ValueError, TypeError):
+                continue
+            # auto 区域按数据类型判定，与 _apply_device_to_context/_resolve_write_target 一致
+            if area == "auto":
+                area = "coil" if point.data_type.value == "bool" else "holding"
+            ranges.append((area, addr, addr + self._point_reg_count(point), point.name))
+        return ranges
+
+    def _find_slave_address_conflicts(self, new_config: DeviceConfig, slave_id: int) -> list[str]:
+        """检测新设备与已占用同一从站号的设备是否存在点位地址重叠。
+
+        同一从站号下地址重叠会导致两台设备的数据互相覆盖（读取数据错误的根因），
+        必须在设备创建时拦截；地址不重叠的共享从站是合法配置（保持向后兼容）。
+
+        :return: 冲突描述列表，空列表表示无冲突
+        """
+        new_ranges = self._normalize_point_ranges(new_config)
+        if not new_ranges:
+            return []
+        conflicts: list[str] = []
+        for device_id, sid in self._slave_map.items():
+            if sid != slave_id or device_id == new_config.id:
+                continue
+            existing_config = self._device_configs.get(device_id)
+            if not existing_config:
+                continue
+            for e_area, e_start, e_end, e_point in self._normalize_point_ranges(existing_config):
+                for n_area, n_start, n_end, n_point in new_ranges:
+                    if e_area == n_area and n_start < e_end and e_start < n_end:
+                        conflicts.append(
+                            f"{e_point}@{e_area}[{e_start}-{e_end - 1}] 与 {n_point}@{n_area}[{n_start}-{n_end - 1}]"
+                        )
+        return conflicts
+
+    def _next_free_slave_id(self, exclude: str = "") -> int:
+        """返回未被占用（且不等于 exclude 设备）的最小从站号，用于冲突提示。"""
+        used = {sid for did, sid in self._slave_map.items() if did != exclude}
+        candidate = 1
+        while candidate in used:
+            candidate += 1
+        return candidate
+
+    async def create_device(self, device_config: DeviceConfig) -> str:
+        # FIXED-P1: 从站号分配与冲突校验必须在注册 behavior 之前完成，
+        # 否则校验失败会留下半注册状态（behavior 已入表但从站未分配）。
+        proto_config = device_config.protocol_config or {}
+        slave_id = proto_config.get("slave_id", self._next_slave_id)
+        if not isinstance(slave_id, int) or slave_id < 1 or slave_id > 247:
+            raise ValueError(
+                f"Modbus slave_id must be between 1 and 247 (got {slave_id}). "
+                "0 is broadcast, 248-255 are reserved per Modbus specification."
+            )
+        # FIXED: 将分配的 slave_id 写回 protocol_config，确保 _build_driver_config 推送到
+        # EdgeLite 时使用相同的 slave_id。之前未写回导致 EdgeLite 默认用 slave_id=1 读取，
+        # 而 ProtoForge 内部用自增 slave_id 存数据，造成读写存储区不匹配。
+        if "slave_id" not in proto_config:
+            proto_config["slave_id"] = slave_id
+            device_config.protocol_config = proto_config
+
+        # FIXED-P1: 同从站号+点位地址重叠会互相覆盖寄存器数据（UI 默认 slave_id=1，
+        # 用户创建第 2 台从站时不改从站地址就会触发“读取的数据不对”），创建时直接拦截。
+        conflicts = self._find_slave_address_conflicts(device_config, slave_id)
+        if conflicts:
+            raise ValueError(
+                f"从站地址 {slave_id} 已被其他设备占用，且点位地址存在重叠：{'; '.join(conflicts)}。"
+                f"请修改本设备的从站地址（如改为 {self._next_free_slave_id(exclude=device_config.id)}），"
+                "或调整点位寄存器地址避免重叠。"
+            )
+        # 地址不重叠的同从站共享是合法配置（向后兼容），但提示用户注意
+        shared_with = [
+            did for did, sid in self._slave_map.items()
+            if sid == slave_id and did != device_config.id
+        ]
+        if shared_with:
+            logger.warning(
+                "Modbus devices %s and %s share slave_id=%d (non-overlapping addresses); "
+                "set a distinct slave address or clear it for auto-assignment if separate units are intended.",
+                shared_with, device_config.id, slave_id,
+            )
+            self._log_debug("system", "slave_shared",
+                            f"设备 {device_config.id} 与 {shared_with} 共享从站 {slave_id}（地址不重叠）；"
+                            "如需独立从站请修改从站地址或留空自动分配",
+                            device_id=device_config.id,
+                            detail={"slave_id": slave_id, "shared_with": shared_with})
+
+        behavior = ModbusDeviceBehavior(device_config.points)
+        async with self._behaviors_lock:
+            self._behaviors[device_config.id] = behavior
+            self._device_configs[device_config.id] = device_config
+        await self._update_default_device_async(device_config.id)
+
+        async with self._behaviors_lock:
+            self._slave_map[device_config.id] = slave_id
+            self._next_slave_id = max(self._next_slave_id, slave_id + 1)
+
+        if self._status == ProtocolStatus.RUNNING:
+            # FIXED: 原生帧处理器直接读写 _data_stores，无需 ModbusDeviceContext/OldAPI 上下文。
+            # _apply_device_to_context 将 behavior 初始值写入 store，原生处理器立即可读。
+            self._get_data_store(slave_id)
+            self._apply_device_to_context(device_config)
+
+        logger.info("Modbus device created: %s (slave_id=%d)", device_config.id, slave_id)
+        self._log_debug("system", "device_created",
+                        msg("modbus_tcp", "device_created", name=device_config.name),  # FIXED: 中文硬编码→i18n常量
+                        device_id=device_config.id,
+                        detail={"slave_id": slave_id, "points": len(device_config.points)})
+        return device_config.id
+
+    async def remove_device(self, device_id: str) -> None:
+        async with self._behaviors_lock:  # FIXED: 添加锁保护
+            self._behaviors.pop(device_id, None)
+            self._device_configs.pop(device_id, None)
+            slave_id = self._slave_map.pop(device_id, None)  # FIXED-P1: 移入_behaviors_lock保护，防止与_process_modbus_frame并发
+            if slave_id is not None:
+                self._data_stores.pop(slave_id, None)
+        await self._clear_default_device_async(device_id)  # FIXED: 使用异步锁版本
+        logger.info("Modbus device removed: %s", device_id)
+        self._log_debug("system", "device_remove",
+                        msg("modbus_tcp", "device_removed", id=device_id),  # FIXED: 中文硬编码→i18n常量
+                        device_id=device_id)
+
+    async def read_points(self, device_id: str) -> list[PointValue]:
+        behavior = self._behaviors.get(device_id)
+        if not behavior:
+            return []
+        config = self._device_configs.get(device_id)
+        if not config:
+            return []
+        slave_id = self._slave_map.get(device_id, 1)
+        now = time.time()
+        result = []
+        for point in config.points:
+            # FIXED: 从 store 读取（非 behavior），支持外部 Modbus 写入反映——双向写关键。
+            # store 由 _apply_device_to_context（behavior→store）和原生帧处理器（外部写入→store）共同维护。
+            value = self._read_register(point, slave_id)
+            result.append(PointValue(name=point.name, value=value, timestamp=now))
+        return result
+
+    async def write_point(self, device_id: str, point_name: str, value: Any) -> bool:
+        behavior = self._behaviors.get(device_id)
+        if not behavior:
+            return False
+
+        # 检查点位是否存在且可写
+        config = self._device_configs.get(device_id)
+        if config:
+            point = next((p for p in config.points if p.name == point_name), None)
+            if point is None:
+                logger.warning("Modbus write_point: point '%s' not found on device %s", point_name, device_id)
+                return False
+            if point.access not in ("w", "rw"):
+                logger.debug("Modbus write_point: point '%s' is read-only on device %s", point_name, device_id)
+                return False
+
+            # FIXED: 按 data_type 归一写入值（bool → True/False、数值转换钳制），
+            # 保证 behavior 值与线圈/寄存器编码一致；不可表示的值拒绝写入
+            try:
+                value = normalize_point_value(point.data_type, value)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Modbus write_point: value %r rejected for point '%s' on device %s: %s",
+                    value, point_name, device_id, e,
+                )
+                return False
+
+        # 更新协议层 behavior 内部状态
+        success = behavior.on_write(point_name, value)
+        if success:
+            # 将写入值同步到 Modbus 数据存储（holding registers / coils）
+            self._apply_device_to_context(
+                self._device_configs.get(device_id, DeviceConfig(id=device_id, name="", protocol="modbus_tcp"))
+            )
+            # 通过 on_write 回调传播到 DeviceInstance，确保内部状态一致
+            if self._on_write:
+                try:
+                    await self._on_write(device_id, point_name, value)
+                except Exception as e:
+                    logger.warning("Modbus write_point: on_write callback error for %s.%s: %s", device_id, point_name, e)
+        return success
+
+    def get_config_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "default": "0.0.0.0", "description": desc("listen_address")},  # FIXED: 中文硬编码→i18n常量
+                "port": {"type": "integer", "default": 5020, "description": desc("listen_port")},  # FIXED: 中文硬编码→i18n常量
+            },
+        }
+
+    def _write_point_to_store(self, point: PointConfig, value: Any, store: ModbusDataStore) -> None:
+        """将单个点位的值写入 Modbus 数据存储（提取自 _apply_device_to_context）。"""
+        try:
+            addr, area = parse_modbus_address(point.address)
+            if area == "coil":
+                store.coils[addr] = int(bool(value))
+            elif area == "discrete":
+                store.discrete_inputs[addr] = int(bool(value))
+            elif area == "input":
+                if point.data_type.value in ("float32",):
+                    data = struct.pack(">f", float(value))
+                    store.input_regs[addr] = struct.unpack(">H", data[0:2])[0]
+                    store.input_regs[addr + 1] = struct.unpack(">H", data[2:4])[0]
+                else:
+                    store.input_regs[addr] = int(value) & 0xFFFF
+            elif point.data_type.value in ("bool",):
+                store.coils[addr] = int(bool(value))
+            elif point.data_type.value in ("float32",):
+                data = struct.pack(">f", float(value))
+                store.holding_regs[addr] = struct.unpack(">H", data[0:2])[0]
+                store.holding_regs[addr + 1] = struct.unpack(">H", data[2:4])[0]
+            elif point.data_type.value in ("float64",):
+                data = struct.pack(">d", float(value))
+                for j in range(4):
+                    store.holding_regs[addr + j] = struct.unpack(">H", data[j * 2:j * 2 + 2])[0]
+            elif point.data_type.value in ("int32",):
+                data = struct.pack(">i", int(value))
+                store.holding_regs[addr] = struct.unpack(">H", data[0:2])[0]
+                store.holding_regs[addr + 1] = struct.unpack(">H", data[2:4])[0]
+            elif point.data_type.value in ("uint32",):
+                data = struct.pack(">I", int(value))
+                store.holding_regs[addr] = struct.unpack(">H", data[0:2])[0]
+                store.holding_regs[addr + 1] = struct.unpack(">H", data[2:4])[0]
+            elif point.data_type.value in ("string",):
+                encoded = str(value).encode("utf-8")
+                if len(encoded) % 2:
+                    encoded += b'\x00'
+                for j in range(0, len(encoded), 2):
+                    word = encoded[j:j + 2]
+                    store.holding_regs[addr + j // 2] = struct.unpack(">H", word)[0]
+            else:
+                store.holding_regs[addr] = int(value) & 0xFFFF
+        except (ValueError, TypeError) as e:
+            logger.warning("Failed to write register %s: %s", point.address, e)
+
+    def _apply_device_to_context(self, config: DeviceConfig) -> None:
+        behavior = self._behaviors.get(config.id)
+        slave_id = self._slave_map.get(config.id, 1)
+        store = self._get_data_store(slave_id)
+        for point in config.points:
+            value = behavior.get_value(point.name) if behavior else 0
+            self._write_point_to_store(point, value, store)
+        # FIXED: 原生帧处理器直接读写 _data_stores，无需同步到 pymodbus context/SimData。
+        # _sync_to_pymodbus_context 仅对 OldAPI 路径有效（self._context 为 None 时是空操作）。
+        self._sync_to_pymodbus_context(slave_id, store)
+
+    async def sync_point_value(self, device_id: str, point_name: str, value: Any) -> None:
+        """内部同步：直接更新 Modbus 数据存储，绕过访问控制检查。
+
+        引擎 tick 循环调用此方法将动态生成的值同步到 Modbus 寄存器/线圈存储，
+        确保非固定生成器（random/sine 等）的值能被外部 Modbus 客户端读到。
+        """
+        config = self._device_configs.get(device_id)
+        if not config:
+            return
+        point = next((p for p in config.points if p.name == point_name), None)
+        if not point:
+            return
+        slave_id = self._slave_map.get(device_id, 1)
+        store = self._get_data_store(slave_id)
+        self._write_point_to_store(point, value, store)
+        self._sync_to_pymodbus_context(slave_id, store)
+
+    def _sync_to_pymodbus_context(self, slave_id: int, store: ModbusDataStore) -> None:
+        """同步 ProtoForge 数据存储到 pymodbus 上下文（仅 OldAPI 路径有效）。
+
+        FIXED(Issue#8): pymodbus 3.13+ 中 ModbusSequentialDataBlock 已移除 setValues 方法，
+        ModbusServerContext.async_setValues 对非 ModbusSimulatorContext 设备返回 ExcCodes.DEVICE_BUSY。
+        此方法在 pymodbus 3.13+ 下为空操作（self._context 始终为 None），保留用于兼容旧版。
+        """
+        if not self._context:
+            return
+        try:
+            if OLD_API_AVAILABLE:
+                slave_ctx = self._context[slave_id]
+                if hasattr(slave_ctx, 'get'):
+                    for fx_name, store_data in [
+                        ('h', store.holding_regs),
+                        ('i', store.input_regs),
+                        ('c', store.coils),
+                        ('d', store.discrete_inputs),
+                    ]:
+                        block = slave_ctx.get(fx_name)
+                        # FIXED(Issue#8): pymodbus 3.13+ 移除了 ModbusSequentialDataBlock.setValues
+                        if block and hasattr(block, 'setValues') and store_data:
+                            fc = {'h': 3, 'i': 4, 'c': 1, 'd': 2}.get(fx_name, 3)
+                            is_bool = fc in (1, 2)
+                            for addr in sorted(store_data.keys()):
+                                val = bool(store_data[addr]) if is_bool else store_data[addr]
+                                try:
+                                    result = block.setValues(fc, addr, [val])
+                                    # FIXED(Issue#8): 检查 ExcCodes 返回值，pymodbus 3.13+ 可能返回错误码而非抛异常
+                                    if result is not None and hasattr(result, 'value') and result.value >= 1:
+                                        logger.warning(
+                                            "pymodbus setValues returned error code %s for fc=%d addr=%d "
+                                            "(pymodbus 3.13+ incompatible, consider downgrading)",
+                                            result, fc, addr
+                                        )
+                                except Exception as exc:
+                                    logger.debug("pymodbus setValues failed for fc=%d addr=%d: %s", fc, addr, exc)
+                        elif block and store_data:
+                            # pymodbus 3.13+: block 已无 setValues 方法，记录一次警告
+                            logger.debug(
+                                "pymodbus block has no setValues method (pymodbus 3.13+ incompatible), "
+                                "skipping sync for slave_id=%d fx=%s", slave_id, fx_name
+                            )
+        except Exception as e:
+            logger.debug("Failed to sync to pymodbus context: %s", e)
+
+    def _read_register(self, point: PointConfig, slave_id: int = 1) -> Any | None:
+        store = self._get_data_store(slave_id)
+        try:
+            address, area = parse_modbus_address(point.address)
+            dt = point.data_type.value
+
+            # FIXED: 根据 area 选择正确的寄存器存储区，与 _write_point_to_store 保持一致。
+            # 之前 bool 始终读 coils、其他类型始终读 holding_regs，
+            # 导致 input register (IR/3x) 和 discrete input (DI/1x) 地址的数据无法读取。
+            if area == "coil":
+                regs_store = store.coils
+                is_bit_area = True
+            elif area == "discrete":
+                regs_store = store.discrete_inputs
+                is_bit_area = True
+            elif area == "input":
+                regs_store = store.input_regs
+                is_bit_area = False
+            else:  # holding or auto
+                # auto 区域：bool→coils，其他→holding_regs（与 _write_point_to_store 一致）
+                regs_store = store.coils if dt in ("bool",) else store.holding_regs
+                is_bit_area = dt in ("bool",)
+
+            if is_bit_area or dt in ("bool",):
+                return bool(regs_store.get(address, 0))
+            elif dt in ("float32",):
+                regs = [regs_store.get(address + i, 0) for i in range(2)]
+                return struct.unpack(">f", struct.pack(">HH", *regs))[0]
+            elif dt in ("float64",):
+                regs = [regs_store.get(address + i, 0) for i in range(4)]
+                return struct.unpack(">d", struct.pack(">HHHH", *regs))[0]
+            elif dt in ("int32",):
+                regs = [regs_store.get(address + i, 0) for i in range(2)]
+                return struct.unpack(">i", struct.pack(">HH", *regs))[0]
+            elif dt in ("uint32",):
+                regs = [regs_store.get(address + i, 0) for i in range(2)]
+                return struct.unpack(">I", struct.pack(">HH", *regs))[0]
+            elif dt in ("int16",):
+                raw = regs_store.get(address, 0)
+                return struct.unpack(">h", struct.pack(">H", raw & 0xFFFF))[0]
+            elif dt in ("uint16",):
+                return regs_store.get(address, 0)
+            elif dt in ("string",):
+                result = bytearray()
+                for i in range(32):
+                    w = regs_store.get(address + i, 0)
+                    result += struct.pack(">H", w)
+                    if w & 0xFF == 0:
+                        break
+                return result.rstrip(b'\x00').decode("utf-8", errors="replace")
+            else:
+                return regs_store.get(address, 0)
+        except (ValueError, TypeError, struct.error) as e:
+            logger.warning("Failed to read register %s: %s", point.address, e)
+            return None
+
+    # FC → Modbus area mapping for reverse write notification
+    _FC_AREA_MAP: dict[int, str] = {
+        0x01: "coil", 0x05: "coil", 0x0F: "coil",
+        0x03: "holding", 0x06: "holding", 0x10: "holding", 0x16: "holding",
+    }
+
+    # FC → 写目标存储区映射（仅外部写入功能码，用于 access 只读校验；
+    # 与 _common.WRITE_FC_AREA_MAP 保持一致，此处引用共享常量）
+    _FC_WRITE_AREA_MAP = WRITE_FC_AREA_MAP
+
+    @staticmethod
+    def _point_reg_count(point: PointConfig) -> int:
+        """返回点位占用的寄存器/线圈数（用于反向映射地址范围匹配）。"""
+        dt = point.data_type.value
+        if dt in ("bool", "int16", "uint16"):
+            return 1
+        elif dt in ("float32", "int32", "uint32"):
+            return 2
+        elif dt in ("float64",):
+            return 4
+        elif dt in ("string",):
+            return 32
+        return 1
+
+    def _resolve_write_target(self, slave_id: int, address: int, fc: int) -> tuple[str, str] | None:
+        """反向映射 Modbus (slave_id, address, fc) → (device_id, point_name)。
+
+        用于外部 Modbus 写入后，将写入操作传播到 DeviceInstance（通过 _on_write 回调）。
+        """
+        target_area = self._FC_AREA_MAP.get(fc)
+        if not target_area:
+            return None
+        for device_id, s_id in self._slave_map.items():
+            if s_id != slave_id:
+                continue
+            config = self._device_configs.get(device_id)
+            if not config:
+                continue
+            for point in config.points:
+                try:
+                    p_addr, p_area = parse_modbus_address(point.address)
+                    # auto 区域按数据类型自动判定（与 _apply_device_to_context 的存储规则一致）
+                    if p_area == "auto":
+                        p_area = "coil" if point.data_type.value == "bool" else "holding"
+                    if p_area == target_area and p_addr <= address < p_addr + self._point_reg_count(point):
+                        return device_id, point.name
+                except (ValueError, TypeError):
+                    continue
+        return None
+
+    def _check_external_write_access(
+        self, slave_id: int, fc: int, start: int, count: int, all_slaves: bool = False,
+    ) -> tuple[str, str] | None:
+        """检查外部写入的目标地址范围是否命中只读点位（access='r'）。
+
+        外部 Modbus 写入（FC05/06/0F/10/16/17）此前不校验点位访问模式，
+        导致界面上标为只读的点位仍可被外部客户端写成功（语义缺口）。
+
+        :param slave_id: 从站 ID
+        :param fc: 写入功能码
+        :param start: 起始地址
+        :param count: 写入的寄存器/线圈数量
+        :param all_slaves: True 时检查所有从站（广播写入会命中全部存储）
+        :return: 第一个被命中的只读点位 (device_id, point_name)，允许写入时返回 None
+        """
+        area = self._FC_WRITE_AREA_MAP.get(fc)
+        if not area:
+            return None
+        end = start + max(count, 1)
+        slave_items = self._slave_map.items() if all_slaves else (
+            (did, sid) for did, sid in self._slave_map.items() if sid == slave_id
+        )
+        for device_id, _sid in slave_items:
+            config = self._device_configs.get(device_id)
+            if not config:
+                continue
+            for point in config.points:
+                if point.access in ("w", "rw"):
+                    continue
+                try:
+                    p_addr = parse_modbus_address(point.address)[0]
+                    p_area = point_area(point)
+                except (ValueError, TypeError):
+                    continue
+                if p_area != area:
+                    continue
+                if p_addr < end and start < p_addr + point_reg_count(point):
+                    return device_id, point.name
+        return None
+
+    def _reject_readonly_write(
+        self, fc: int, slave_id: int, fc_name: str, start: int,
+        readonly_hit: tuple[str, str], is_broadcast: bool,
+    ) -> bytes | None:
+        """外部写入命中只读点位时的统一拒绝处理：记日志并返回异常响应。
+
+        异常码采用 0x01（ILLEGAL FUNCTION）：该写功能对此点位不允许执行。
+        广播请求无响应，仅记日志并丢弃整个写入。
+        """
+        device_id, point_name = readonly_hit
+        logger.warning(
+            "External Modbus write rejected: point %s.%s is read-only (access='r'); "
+            "fc=%s start=%d slave_id=%d",
+            device_id, point_name, fc_name, start, slave_id,
+        )
+        self._log_debug(
+            "inbound", "modbus_write_rejected",
+            f"{fc_name}: addr={start} rejected (read-only point {device_id}.{point_name})",
+            detail={"fc": fc, "start": start, "unit": slave_id,
+                    "device_id": device_id, "point": point_name, "reason": "read_only"},
+        )
+        if is_broadcast:
+            return None
+        return self._err_response(fc, self._EX_ILLEGAL_FUNCTION)
+
+    def _notify_external_write(self, slave_id: int, fc: int, address: int, value: Any) -> None:
+        """外部 Modbus 写入后异步触发 _on_write 回调，传播到 DeviceInstance。
+
+        通过 asyncio.create_task 异步触发，不阻塞 Modbus 帧处理。
+        """
+        if not self._on_write:
+            return
+        target = self._resolve_write_target(slave_id, address, fc)
+        if not target:
+            return
+        device_id, point_name = target
+        if value is None:
+            # Multi-register/coil frame handlers (FC0F/10/17) don't carry a
+            # scalar value; without reading the written value back the engine's
+            # DeviceInstance.write_point(None) is rejected and the 30s write
+            # freeze never engages, so the generator overwrites the push.
+            config = self._device_configs.get(device_id)
+            point = next((p for p in config.points if p.name == point_name), None) if config else None
+            if point is not None:
+                try:
+                    value = self._read_register(point, self._slave_map.get(device_id, 1))
+                except Exception as e:
+                    logger.debug("Failed to read back written value for %s.%s: %s", device_id, point_name, e)
+            if value is None:
+                return
+        asyncio.create_task(self._fire_write_callback(device_id, point_name, value))
+
+    async def _fire_write_callback(self, device_id: str, point_name: str, value: Any) -> None:
+        """异步执行 _on_write 回调，捕获异常防止影响事件循环。"""
+        if not self._on_write:
+            return
+        try:
+            await self._on_write(device_id, point_name, value)
+        except Exception as e:
+            logger.debug("External write callback error for %s.%s: %s", device_id, point_name, e)
+

@@ -1,0 +1,1310 @@
+# Changelog
+
+## v1.11.1 — 2026-11-01
+
+### ✨ 改进 — Modbus RTU 高级配置暴露 TCP 桥接模式（RTU over TCP）
+
+用户询问"支持 modbus rtu over tcp 嘛"——TCP 桥接能力早已存在（`mode=tcp_bridge` 时 RTU 数据区通过以太网口对外提供服务，客户端以 Modbus TCP/MBAP 帧连接，默认端口 5021），但高级配置界面没有暴露该开关，只能通过 API 手工设置。本次将 `mode`（serial/tcp_bridge）与 `tcp_bridge_port` 两个字段加入 Modbus RTU 的高级配置。
+
+> 说明：桥接端口使用 Modbus TCP（MBAP）帧；严格的"RTU 帧 + CRC 直走 TCP（无 MBAP）"帧格式暂不支持，如有需求欢迎反馈。
+
+### 🐛 修复 — admin/admin 登录失败（GitHub issue #6，多用户反馈的高频问题）
+
+**根因（两个叠加）**：
+
+1. **真缺陷**：未设置 `PROTOFORGE_ADMIN_PASSWORD` 时，每次启动都重新随机
+   生成密码并**覆盖** `data/.admin_password`——用户重启一次服务，上次记录
+   的密码就作废，admin/admin 又不可用（桌面便携包用户重灾区：黑窗口日志里
+   的提示根本看不到）。修复：已有密码文件则**沿用**（重启不再更换），
+   仅首次启动生成落盘。
+2. **提示不自解释**：登录失败只报 "Invalid username or password"。修复：
+   401 响应直接给出恢复路径（设环境变量 / 查 .admin_password 文件）；
+   桌面版首次生成密码时弹**托盘气泡**告知文件位置。
+
+**恢复方法**：设 `PROTOFORGE_ADMIN_PASSWORD=新密码` 环境变量（桌面版在
+.env）重启即生效——环境变量密码每次启动都会同步，一劳永逸。README 已补
+「登录不上排查」四步。新增 4 个密码语义回归用例（tests/test_admin_password_issue6.py），
+并修复 test_v18_realism 三个 drift 测试的跨秒时序 flake（冻结时钟）。
+
+## v1.11.0 — 2026-11-01
+
+### ✨ 新增 — 性能基准与大规模仿真：给出官方数字（v1.11.0）
+
+**① 性能基准模块**（`protoforge/benchmark/`）——三个内置场景，真实数字写入
+[docs/性能白皮书.md](docs/性能白皮书.md)：
+
+- `engine_tick_generation` 引擎生成吞吐：**1000 设备 × 10 万测点 tick 仅 1.1ms**
+  （P95 1.36ms，内存 ≈1.6KB/测点）；100 设备×50 点 tick 0.12ms
+- `modbus_wire_read` Modbus TCP 线级读延迟（真实 socket）：**P50 0.40ms /
+  P99 0.54ms，单客户端 2,458 读/秒，1000 次零错误**
+- `modbus_concurrent_read` 10 并发客户端：聚合 **1,913 读/秒**（P99 5.6ms）
+
+结果持久化 `data/benchmarks/`（含 python/平台/CPU 指纹）；API
+`/api/v1/benchmarks/*`（后台执行防事件循环阻塞）；**同场景对比回退 >10%
+判 REGRESSION（exit 1）——CI 性能门禁可直接落地**。
+
+**② 大规模仿真**：
+- 引擎 tick 分片（`tick_shard_size`，默认每 100 台设备让出事件循环）——
+  大批量设备不再拖慢同进程 API/协议响应；tick 平均/最大时长可观测
+  （`engine.tick_stats`）
+- **连接数上限可配**：`protocol_config.max_connections`（0=不限），
+  20 个 TCP 协议服务器统一接入连接门（超限拒绝 + network 错误计数）
+- 内存可观测：`/api/v1/integration/metrics` 补进程 RSS/虚拟内存/线程/
+  句柄 + 各协议活跃连接数（Prometheus gauge）；pyproject 显式声明 psutil
+
+**③ CLI**（可进 CI）：
+
+    protoforge benchmark scenarios            # 场景清单
+    protoforge benchmark run --scenario modbus_wire_read         --compare-to <baseline-id>            # 回退 >10% exit 1
+    protoforge benchmark list                 # 历史结果
+
+**④ 性能白皮书**（docs/性能白皮书.md）：实测数字 + 每场景一条复现命令 +
+容量规划表 + 方法论与边界诚实声明（24h 长跑方法给出、不声称已完成）。
+
+### 🧪 测试
+
+新增 tests/test_benchmark.py（场景注册/分位计算/三场景小参数实跑/对比门禁
+回归判定方向性）+ tests/test_scale_features.py（tick 分片行为等价、连接上限
+端到端拒绝、默认不限、内存 gauge）；全量回归 1423+ passed。
+
+## v1.10.0 — 2026-11-01
+
+### ✨ 新增 — 测试数据闭环：可复现、可对比（v1.10.0 五件套）
+
+**① 环境即代码** — 声明式 YAML 定义整套环境（设备/协议/协议配置/点位/生成器），
+`protoforge env export / apply / diff` 三命令 + `/api/v1/env/*` 端点。环境文件
+天然进 Git、可 review：`export` 从运行环境导出快照，`apply` 一条命令重建
+（单设备失败不中断其余，dry-run 支持），`diff` 发现漂移（新增/缺失/字段级变更）。
+新建环境到起设备 ≤1 分钟（100 设备级批量 create+start）。
+
+**② 数据基线与回归对比** — `protoforge baseline capture/compare` +
+`/api/v1/baselines/*`。基线快照（点位当前值 + 逐点/默认容差）存 JSON 文件
+（`data/baselines/`，可进 Git）；compare 逐点判定（数值容差 / 布尔字符串精确
+相等 / missing / type_mismatch），产出含通过率与超差清单的回归结论报告
+（可直接作附件）。
+
+**③ 报告体系升级** — 每次测试执行可导出：
+- **Allure2 results**（`GET /api/v1/test-runs/{id}/allure`）：`allure generate`
+  直接可用（result/container/environment.properties/categories 全套），接入
+  QA 看板生态
+- **归档 HTML**（`GET /api/v1/test-runs/{id}/archive-report`）：自包含单文件
+  （内联样式、无外链脚本、打印友好 CSS——浏览器"打印→另存为 PDF"即得企业
+  归档 PDF 件）
+
+**④ 定时测试 + 通知** — 测试计划 `schedule.cron`（标准 5 字段）由服务端调度器
+落地（整分钟命中只触发一次、停机补跑防风暴、schedule_last_run 持久化防重启
+重复）；执行完成自动推送 **Webhook / 钉钉 / 企业微信 / 邮件（SMTP）** 四渠道
+（`PUT /api/v1/notifiers` 管理、敏感字段脱敏、`POST /api/v1/notifiers/test`
+实测送达）。事件语义精确：test.completed=通过时发，test.failed=失败时发，
+通知失败绝不影响测试结果。
+
+**⑤ 测试计划对比视图** — `GET /api/v1/test-runs/compare?a=&b=`：两次执行的
+套件级状态迁移（passed→failed 标记 regression）+ 汇总数字增减，定位引入
+回归的变更。
+
+### 🧪 测试
+
+新增 tests/test_data_closure.py 12 用例：manifest 导出/重建/漂移发现、基线
+容差三态（超差/类型失配/缺失）+ 持久化、Allure 结构与归档 HTML 自包含断言、
+cron 匹配（含越界/字段数校验）与调度不重复触发、对比回归判定方向性、四通知
+渠道分发与事件过滤、API 往返与脱敏。全量回归 1411+ passed。
+
+## v1.9.1 — 2026-10-31
+
+### 🐛 修复 — Modbus RTU 串口模式从不打开 COM 口（GitHub issue #36）
+
+用户报告（Windows 11）：启动 Modbus RTU 指定 COM1 后，串口监视工具显示 COM1 一直空闲，怀疑"是从 TCP 做的桥接"——完全正确。pymodbus 3.13 下写值 API 失效（Issue#8）的规避代码把串口模式整体放弃：无论串口是否存在都**静默回退 TCP bridge，串口永不打开**，协议状态仍显示 RUNNING 且无任何提示。
+
+修复：串口模式改为**自持串口 IO**（不再依赖 pymodbus 串口 server 端）——真正打开并占用 COM 口、RTU 3.5 字符分帧 + CRC16 校验、值通路与 TCP 模式完全一致（同一套原生帧处理器）；广播（addr=0）只执行不回包；打开串口失败置 ERROR 并抛出含串口名的明确错误，不再静默回退。TCP bridge 改为显式 `mode=tcp_bridge`（edgelite 集成兼容保留）。另补上此前**漏声明的 pyserial 核心依赖**。已在本机真实 COM1 上验证占用/释放，CI 全矩阵回归通过。
+
+### 🐛 修复 — BACnet 在 Python 3.10 / Windows ≤3.11 下不可用（CI unit-tests 3.10 长期红）
+
+BACnet 服务器的 UDP 收发用了 `loop.sock_recvfrom/sock_sendto`——Python **3.11 才加入**的 asyncio API，3.10 上每次 AttributeError 被宽 except 吞掉后进入 10ms 重试死循环，UDP 请求永无响应（CI `unit-tests (3.10)` 自基线起持续失败；Windows + Python ≤3.11 上 BACnet 服务器完全不可用）。修复：按 API 能力分支——3.11+ 保持原路径，3.10 走线程池桥接（带超时可停止）；对 3.11+ 行为零变化。顺带使 Windows 低版本 Python 下 BACnet 恢复可用。
+
+## v1.9.0 — 2026-10-31
+
+### ✨ 新增 — 主站模式第一批（Modbus TCP/RTU、S7、IEC 104）：拨出轮询真实设备，协议转换免费获得
+
+此前 ProtoForge 只能做从站侧（设备仿真）。v1.9.0 新增主站（Master/Client）方向：
+**主动拨出**连接真实从站设备，按扫描周期轮询点位。远端值进入本地点位存储——
+主站设备出现在设备列表、点位显示真实设备实时值、SCADA 可经 ProtoForge 自身任意
+协议服务器读取这些值（协议转换/透传能力随之免费获得）、测试引擎的既有断言体系
+可直接对主站设备做"读从站 → 断言 → 记录"（固件回归自动化无需新增测试步骤类型）。
+
+**三种主站协议**（`protoforge/protocols/master/`，统一 MasterBase 轮询框架）：
+
+- **modbus_master**：pymodbus 3.13 客户端，支持 TCP / RTU-over-TCP / 串口 RTU 三种
+  链路；地址记法与从站完全一致（HR/IR/C/DI、4x/3x/0x/1x、40001 等PLC 记法）；
+  同区连续地址自动合并批量读取；float32/int32 等多寄存器类型大端序解码，
+  与 ProtoForge 从站存储规则一致；支持写远端寄存器/线圈
+- **s7_master**：原生 TPKT/COTP/S7 帧客户端（snap7 兼容序列：CR→CC→Setup F0→
+  Read/Write Var），支持 DB1.DBD0/DBX0.0/M/I/Q 全地址记法，机架/槽号经 TSAP
+  配置，支持写 DB 值与位
+- **iec104_master**：STARTDT→总召（C_IC_NA_1 QOI=20）→逐帧收集遥测遥信直到
+  ACTTERM；支持 M_SP/M_DP/M_ME_NA/NB/NC 监视方向解码；遥控 C_SC、遥调 C_SE
+  （标度化/浮点）直接执行等 ACTCON+ACTTERM 双确认；TESTFR 自动应答
+
+**主站通用能力**（MasterBase）：扫描周期可配（0.1~3600s 钳制）、连接/IO 超时、
+断线指数退避重连（3s→60s 封顶）、点位质量标记（轮询失败 quality=bad）、轮询
+统计（成功/失败/最后错误，API 可查）、优雅停止（沿 v1.8.1 取消传播语义）。
+
+### ✨ 新增 — 报文字段级解析器（Wireshark 式逐字段展开，9 协议）
+
+`POST /api/v1/compliance/decode-frame`：输入协议名 + 报文 hex（或 base64），
+输出字段树（名称/偏移/长度/原文/可读值/语义注解/子字段），用于联调排障、
+驱动开发、教学演示。覆盖 **modbus_tcp / modbus_rtu / s7 / iec104 / dlt645 /
+cjt188 / fins / mc / mewtocol** 九种协议；CRC16、CS、BCC 等校验字段自动重算
+比对，不符记入 errors；截断帧容错（能解多少解多少）。Modbus 请求/响应按
+帧长无歧义判定。
+
+### ✨ 新增 — 合规检测 +2（累计 9 协议）
+
+- **FINS**（FINS-001~004）：TCP magic、MRC 合法性、成功类消息 end code、
+  数据报头完整性
+- **DL/T 645**（D645-001~005）：帧定界符、地址 BCD 校验、控制码合法性、
+  数据域长度、CS 校验和
+
+### 🧪 测试
+
+新增 4 个测试文件共 51 用例：主站回环集成（三协议主站 → 本机从站全链路 +
+引擎级读写 + RTU-over-TCP 字节级 stub）、帧解码（9 协议黄金帧 + 校验失败
+检出 + 截断容错）、合规扩容、decode-frame API。
+
+### 📝 升级说明
+
+- 新协议名 `modbus_master` / `s7_master` / `iec104_master`，协议列表自动出现，
+  设备级配置含拨出目标（host/port）、扫描周期、超时
+- 对既有从站仿真、API、配置无任何行为变更——纯新增能力
+
+## v1.8.6 — 2026-10-31
+
+### 🐛 修复 — 布尔点位"随机"生成器恒为 True（报警位永远不变化）
+
+布尔点位配置"随机"生成器时，原实现 `random.uniform(min,max)` 经 `bool()` 转换——min≥1 时值**恒为 True**（用户实测：报警位永远是 1，被误以为"读不到/通讯问题"）。修复：布尔点位的动态生成器（随机/正弦/三角/锯齿/方波/随机游走）统一为随机 0/1 翻转，符合报警仿真的真实预期；固定值/脚本生成器仍精确输出。Modbus 侧已实测 FC1 读线圈值正常翻转。
+
+## v1.8.5 — 2026-10-26
+
+### 🐛 修复 — 登录后跳转页面 token 被清空、被踢回登录页（Gitee issue #IKQA71）
+
+用户反馈：系统部署完成后登录，点击其他页面系统无反应，F12 发现 token 丢失，刷新回到登录页。
+
+根因：前端路由守卫在浏览器侧本地解码 JWT 校验 `exp`，当**本机时钟比服务器快 ≥
+token 有效期（30 分钟）**时，刚签发、服务端完全有效的 token 在浏览器看来已经
+"过期"，守卫不做任何续期尝试就直接清空 token 并弹回登录页。Docker/服务器与
+访问电脑时钟不同步是常见场景（尤其内网、离线工控机）。
+
+修复：
+
+- **main.js 路由守卫**：token 被本机判定过期时，先用 refresh_token（7 天有效，
+  服务端校验与时钟无关）静默续期，成功则放行导航；续期失败才清空登录态。
+  同时输出自解释 console.warn——包含 exp、本机时间、两端时钟相差分钟数，
+  用户打开 F12 即可自助判断是时钟问题
+- **Login.vue**：登录成功即检测本机与服务器时钟偏差（对比 JWT iat 与本机时间），
+  偏差超过 2 分钟弹出自解释告警"请校准本机系统时间"，i18n 中英双语
+
+验证：前端 `npm run build` 通过。
+
+> 若两端时钟差超过 token 有效期且 refresh_token 也失效，仍会回登录页——
+> 此时 F12 Console 会明确提示时钟偏差，校准任一端系统时间即可解决。
+
+## v1.8.4 — 2026-10-25
+
+### 🐛 修复 — AB/EIP 字符串写入被解析成整数垃圾值（0x4B / 0x4D 双路径）
+
+欧姆龙 NJ Demo（GcodeZuo/GcodeYou 标签）实测场景：客户端按标准 CIP STRING
+编码 `[长度 UINT][字符]` 写字符串标签时，服务端 `_unpack_cip_value`（0x4D
+Write Tag）与 `_unpack_pccc_write_value`（0x4B Execute_PCCC）都没有 string
+分支，ASCII 文本落进 4 字节小端整数分支——写入 `"9999"` 会被存成
+`0x39390004`（959254532）之类的垃圾整数。
+
+修复：两条写入路径补上字符串解析——优先按 `[strlen UINT][字符]` 标准编码，
+长度不符时回退按原始 ASCII 文本（兼容不带头部的简化客户端）。读回编码
+（`0xA0` + strlen + utf-8）不变。
+
+回归：0x4D 标准字符串写读回往返、裸 ASCII 回退、0x4B 双编码字符串写
+（tests/test_ab_inovance_demo.py，共 14 用例）。
+
+> 说明：本次用户反馈的"写入 9999 读出 99990"经逐字节核对，ProtoForge
+> 服务端存值正确（9999/456 稳定返回），Demo 显示 ×10 为其标签显示配置
+> 问题；但排查中发现上述字符串写入解析缺陷为真实 bug，一并修复。
+
+## v1.8.3 — 2026-10-24
+
+### 🐛 修复 — IEC 61850 Identify 服务从未被分发到（黄金用例抓到的第 5 个真缺陷）
+
+`TAG_IDENTIFY_REQ` 与 `TAG_CONCLUDE_REQ` 常量同为 0x82，分发链中 Conclude
+在前——Identify 请求永远被当作 Conclude 处理、返回空的 Conclude-Con。
+MMS Identify（客户端获取服务器厂商/型号/版本）功能自实现以来不可用。
+修复：TAG_IDENTIFY_REQ 改为未占用的 0x85。回归：PDU 级黄金用例
+（Identify 响应含 vendor/model/revision + Conclude 往返 + 非法 tag 静默丢弃）。
+
+### 🔧 测试基建 — stop() 取消传播语义统一（外部取消不再被吞）
+
+全部 22 个协议服务器的 stop() 用 suppress(CancelledError) 一律吞掉取消——
+无法区分"服务任务自身的取消"与"外部取消"（wait_for 超时/事件循环关闭），
+后者被吞后 wait_for 的 TimeoutError 一并被抑制、调用方在 Python 3.12.0 上
+永久挂起（全量回归间歇挂起的根因，协程级栈转储实测定位；干净 master 同样
+复现，属预存问题）。修复：
+
+- base.py 新增共享 helper `shutdown_server_task(task)`（吞掉任务自身的
+  取消；`Task.cancelling() > 0` 即外部取消时继续传播，3.10 降级为旧行为）
+  与 `externally_cancelled()`；22 个协议 stop() 机械替换（modbus/opcua
+  嵌套结构手工修复）
+- wire_golden_harness：free_tcp_port 取号后验证无监听者（端口碰撞导致
+  连接打到错误服务器）；open_conn 带超时；golden 批次 teardown 统一
+  shield 包裹（超时必然触发）+ except 分支关闭 writer
+- tests/test_stop_cancellation.py：取消传播语义 4 用例
+- tests/_hangdump_plugin.py 诊断插件（协程级 await 链转储，按需 -p 加载）
+
+## v1.8.2 — 2026-10-24
+
+### Fixed — AB/EIP：Execute_PCCC 写标签按点位类型解析，修复"写入了但值不变"（用户实测反馈）
+
+用户从汇川 Demo 对 ProtoForge 写标签后值不变化。复现确认三处缺陷：写判定要求载荷后 `len(extra) >= 4`，Demo 对 BOOL(1 字节)/INT16(2 字节) 的最小编码写请求被当读请求静默忽略；写值一律按 `<I` 整数解析，FLOAT32 写 1.5 被解析成 1069547520；引擎拒绝写入（点位只读/不存在/设备状态不允许）时用户完全看不到原因。
+
+- **server.py**：写判定放宽为"载荷后有任意剩余字节"；写值改按点位数据类型解析（bool 取首字节、int16/uint16 取前 2 字节、int32/uint32 取前 4 字节、float32/float64 按 IEEE 浮点），兼容最小编码与 4 字节小端两种布局
+- **server.py**：新增"外部写入"自解释日志（`外部写入: 设备(X) 点位 Y = Z (标签 'W')，30 秒内动态生成暂停`）——用户在调试页可直接确认写入是否落库；引擎侧拒绝写入时同样输出"外部写入被拒绝"并附常见原因（权限只读/点位不存在/设备状态），不再只进后端日志
+- **tests**：厂商回归用例补 4 项写路径锁定——BOOL 1 字节写、INT16 2/4 字节写、FLOAT32 浮点写、写后读回
+- 验证：AB 测试 19 项全绿
+
+### 说明 — 写入值的查看位置
+
+写进去的值在两处可看：设备页点位列表的"值"列（实时刷新）；调试日志页的"外部写入"记录。注意：点位的动态生成器（随机/正弦等）在写入后 30 秒恢复，会继续覆盖写入值；需要固定值请把该点位的生成方式改为"固定值"。
+
+## v1.8.1 — 2026-10-24
+
+### 🔧 真机联调与测试基建修复（三风险清零专项）
+
+**修复 — EdgeLite 真机联调用例"120s 未就绪"（v1.5.0 起间歇失败的根因闭环）：**
+
+- **主因（测试侧）**：EdgeLite 的 InfluxDB 降级时序库 `sqlite_ts_path` 默认是
+  仓库内相对路径 `data/edgelite_ts.db`——联合测试多次运行后已膨胀到
+  **3.2GB 主库 + 1.8GB WAL**，EdgeLite 启动降级模式时对其执行
+  `PRAGMA integrity_check`（全库扫描）远超 120s 就绪窗口。fixture 现将
+  `EDGELITE_INFLUXDB__SQLITE_TS_PATH` 一并指向临时目录（integrity_check
+  对空库瞬间完成）。真机联调 3/3 全绿（采集/回放/协同）。
+- **次因（环境侧，有 Issue #15 先例）**：httpx 默认 `trust_env=True` 会读取
+  Windows 注册表系统代理——本机 Clash Verge 运行时对回环临时端口返回 502。
+  real_machine_joint 与 e2e_multi_protocol_real 共 7 个 httpx 客户端全部
+  显式 `trust_env=False`（与 version_check 的既有做法一致）。
+
+**修复 — 全量回归偶发挂起（本地 Python 3.12.0 的 asyncio 唤醒缺陷）：**
+
+- 定性：挂起时事件循环空转于 select/_poll、被挂协程的定时器与回调**全部
+  失效**（自制的协程级栈转储证实），Selector 与 Proactor 循环均可复现，
+  单独运行永远不复现——与本机 Python 3.12.0 的 asyncio 唤醒缺陷画像一致
+  （3.12.1+ 已修；CI 的 3.12 最新补丁版从不复现）。
+- 缓解（仓库侧可做的全部）：
+  1. **pytest-timeout**（dev 依赖 + `timeout=120/thread` 全局配置）：任何单测
+     超 120s 自动全栈转储并快速失败，套件永不无限挂起；
+  2. tests/conftest 统一 Windows 下使用 `WindowsSelectorEventLoopPolicy`
+     （与 EdgeLite 生产选择一致）；
+  3. wire-golden 批次测试的 `open_connection`（14 处）与 `server.start`
+     （10 处）全部加超时护栏（harness 新增 `open_conn`）；
+  4. `tests/_hangdump_plugin.py` 诊断插件入库（`-p tests._hangdump_plugin`
+     按需加载，转储协程级 await 链）。
+- 根治需本机升级 Python ≥3.12.1（CI 不受影响）。
+
+### 升级提示
+
+无 API 变更；本版本主要为测试基建修复。Docker：`docker pull suoten/protoforge:1.8.1`。
+
+## v1.8.0 — 2026-10-24
+
+### 🎭 告警行为学（升级规划 v1.8.0"数据不再假"专项）
+
+测告警系统是 SCADA/组态 QA 的独立需求——此前故障注入能制造"设备故障"，但制造不了"告警行为学"。新增 `protoforge/simulation/alarm_behavior.py` 三个模型，与既有物理行为模型（thermal/motor/pressure/flow/level/valve/pid）同构，继承 BaseBehavior 并接入 `create_behavior` 工厂（字典 + 字符串两种配置格式，惰性分发避免循环导入）：
+
+- **AlarmStormBehavior 告警风暴**：持续（条/秒恒定）与突发（burst/idle 周期）两种模式，消息池循环取用、全局序号连续不丢失、总数上限精确截断——测告警处理链路的吞吐与不丢能力；
+- **ChatteringBehavior 告警抖动（chattering）**：阈值附近快速翻转的方波，周期/占空比/随机抖动可配，`flip_count` 暴露翻转次数——测被测系统的防抖/死区/告警抑制逻辑；
+- **SOESequenceBehavior SOE 事件序列**：毫秒时标有序事件流，乱序输入自动排序、`time_scale` 支持倍速回放、`repeat_interval` 循环重播（lap 轮次递增）、`to_dict/from_dict` 断点续播——测 SOE/顺序记录系统的分辨率与排序正确性。
+
+**行为模型库现状（规划验收 ≥10 达标，共 13 个）**：物理 7 个（热传导/电机/压力/流量/液位/调节阀/PID）+ 设备状态机 + 告警行为学 3 个 + 时间序列模式（日/周/季节/批次/老化）。
+
+### ⏱️ 传感器漂移时间单位（SENSOR_DRIFT 增强）
+
+`drift_unit` 参数支持 `"second"`（缺省，完全兼容旧行为）/ `"hour"` / `"day"`——按天语义下 drift_rate 即"每天漂移量"，测能管/资产管理系统的周月级传感器老化场景无需再手工换算秒。
+
+### 🏭 官方演示场景（规划验收 3 个，随版本发布）
+
+`examples/scenarios/` 新增 3 个可直接 `/scenarios/import` 导入的完整场景（设备 + 生成器 + 阈值联动规则，全部通过 ScenarioConfig 校验并有资产测试防回退）：
+
+- **demo-boiler 锅炉房**：汽包水位/汽压/炉温正弦波动，汽压超高自动停炉、水位过低启泵；
+- **demo-line 产线**：卷绕线速度三角波、张力正弦越限报警、批次计数累加；
+- **demo-pump 泵站**：集水井液位涨落，一用一备双泵联动启停。
+
+### 升级提示
+
+- 告警行为模型可按既有方式挂接：`create_behavior({"behavior": "alarm_storm", "params": {...}})` 或字符串 `"chattering:period=0.5"`；
+- Docker：`docker pull suoten/protoforge:1.8.0`；
+- 演示场景：`POST /api/v1/scenarios/import` 导入 `examples/scenarios/*.json` 后一键启动。
+
+## v1.7.0 — 2026-10-23
+
+### 📋 点表导入（升级规划 v1.7.0 头条：从客户 Excel 到设备）
+
+**新增 — 点表导入引擎 + 导入向导（`protoforge/core/point_table.py` + API + 前端）：**
+
+国内项目的起点几乎都是客户给的点表 Excel。本版本把"逐行手敲"变成"粘贴 → 预览 → 确认"：
+
+- **厂商地址风格自动识别（15 类）**：西门子 DB 块/DBX/DBB/DBW/DBD、M 区、I/Q 区（E/A 同义）、三菱 D/R/ZR/SD 与 X/Y、欧姆龙 CIO/W/DM、DL/T 645 数据标识、Modbus 0x/1x/3x/4x 前缀与 5 位/6 位 PLC 编址、IEC 104 IOA、通用数字；
+- **协议兼容性校验**：主导风格与目标协议寻址不一致时逐点警告（地址原样传给协议自身的解析器——它们才是权威，本引擎不做有损转换）；
+- **冲突显式暴露**：Modbus 复用寄存器重叠检测（float32 相邻覆盖类问题导入期即拦截）；其余协议做同地址多点检测；重复点名提示——预览可见，绝不静默导入；
+- **数据类型归一化**：Real/WORD/BIT/DWORD/组态常见写法 → 规范类型；未知写法降级 float32 并逐行提示；
+- **中英文表头映射**：点名/数据项/位号/名称、地址/数据标识/寄存器地址等常见表头自动识别；
+- **API** `POST /devices/import-point-table`：`dry_run=true` 返回映射/冲突/警告预览，`dry_run=false` 建设备（冲突 422 拒绝）；
+- **前端向导**：设备管理页新增「点表」入口——选协议 → 粘贴/上传（CSV/TSV/XLSX）→ 风格统计 + 逐点预览 + 冲突/警告 → 确认导入；
+- **Excel 支持为可选依赖** `[pointtable]`（openpyxl，懒加载；CSV/TSV 无需任何额外依赖）；
+- **样例点表**：`tests/samples/` 内 5 份厂商风格样例（西门子/三菱/欧姆龙/Modbus/DL-T645），导入成功率 100%（规划验收 >95%）；1000 点解析 <10 秒（实测 <1s）。
+- 协议槽位 #1（用户投票选协议）本版悬置：当前用户基数下投票样本不足，继续以 issue/群反馈热度替代。
+
+### 🛡️ 合规检测扩容（5 → 7 协议）
+
+- **BACnet**（BC-001~005）：BVLC 版本/功能码、NPDU 版本、APDU 类型、确认服务选择码；
+- **IEC 61850 / MMS**（MMS-001~004）：PDU tag、BER 长度编码（short/long form）、Confirmed PDU invoke ID、LD 域名约定。
+
+### 🧪 Wire 级黄金用例铺开（13 → 25 协议，+12）
+
+新增 9 个测试文件、25 个用例进 CI `wire-golden-gate` 门禁（真实 socket 收发 + 字节级断言）：custom_tcp（raw/template 两模式）、custom_udp、toledo（稳定/负称重 ASCII 帧）、opcda（PFDA browse/read/write 回读）、s7plus（COTP CC/setup/read）、fanuc（DBP connect/acts）、coap（RFC 7252 CON GET→ACK 2.05，MID/token 回显 + Content-Format 12）、http（/health 状态行/头/JSON 全断言）、mtconnect（/probe XML 契约）、profinet（DCP identify xid 回显 + IP block）、ethercat（BRD 寄存器读 + working counter）、iec61850（MMS Identify 往返）。
+
+**尚未覆盖 3 个**（均有明确原因）：gb28181（SIP Digest 注册需假 SIP 服务器闭环，下批次）、dds（UDP publish 模式无响应帧，无法请求-响应断言）、opcua_client（客户端模式，无本地服务端可测）。
+
+**黄金用例上线即抓到并修复 2 个真实 wire 缺陷：**
+
+1. **OPC-DA 桥接写往返数据损坏**：`_pack_typed_value` 打包带 1 字节类型前缀，`_unpack_typed_value` 解包未跳过前缀——外部客户端写入 21.0 读回 5e-239。全部类型统一跳过前缀并补 string 分支；
+2. **PROFINET DCP identify 配置真实 IP 必崩**：IP block 的 struct 格式串 `>BHIHII` 把 4 字节子网掩码塞进 H(2B)——默认空 IP 走 ValueError 全 0 兜底掩盖了缺陷。改为标准布局 `>BHIIIH`（block_len=14 = IP4+Mask4+GW4+Reserved2）。
+
+### 修复 — 其余
+
+- 点表导入修复过程中发现 `_rows_from_csv` 多余列告警误报路径（多列 CSV 行提示语义修正）。
+
+### 升级提示
+
+- pip 用户：Excel 导入需 `pip install 'protoforge[pointtable]'`（或 `[all]`）；CSV/TSV 开箱即用；
+- Docker：`docker pull suoten/protoforge:1.7.0`；
+- 前端重新构建后设备管理页出现「点表」按钮。
+
+## v1.6.40 — 2026-10-23
+
+### Added — 连通性排查可自解释：厂商回归测试 + 标签未命中自解释日志 + 表单协议化引导
+
+连续多轮 AB/EIP 兼容性支持（汇川 EIP Demo 等）暴露的共同短板：用户配置错了没有任何提示，只能靠导出日志人工逐帧排查。本次将三条改进一次落地，让"配置错了"从用户看不见变成系统主动告诉用户错在哪。
+
+- **server.py**：0x4B 标签读未命中时输出自解释日志——包含客户端请求的标签名和该设备已注册的全部点位名/地址（如 `标签未命中: 'run_status' —— 设备已注册点位/地址: 0, point_1。请让客户端标签名与点位名称或地址一致，保存后重连。`），用户在日志页即可自助定位拼写不一致，无需导出日志等人工分析
+- **tests/test_ab_inovance_demo.py**（新增）：以汇川 EIP Demo 真实抓包为蓝本的 4 项厂商回归用例，锁定全链路行为——RegisterSession → 0x0E(`8e 01 00 00`) → Large Forward Open(`db`) → 空帧心跳回送（同 seq、`00 00`）→ 0x4B 读命中（BOOL/INT16/FLOAT32 按类型码尺寸打包）→ 未命中拒绝(`cb 04 00 00`)，防止后续改动破坏已打通的厂商链路
+- **web**（Devices.vue + i18n）：地址栏占位符按协议差异化提示——AB 显示"标签名，如 point_1（CIP 按名称寻址）"、Modbus 系显示"寄存器地址，如 40001"、三菱系显示"软元件地址，如 D100"；AB 设备新增点位时默认地址直接采用点名（不再默认 Modbus 风格的数字寄存器地址），从源头杜绝"AB 设备把地址填成 0"这类必踩的坑
+- 验证：AB 测试 15 项全绿（含新增厂商用例 4 项）；前端 `npm run build` 通过
+
+## v1.6.39 — 2026-10-22
+
+### Fixed — AB/EIP：点位名回退匹配 + 0x4B 读值按类型尺寸打包（用户实测反馈）
+
+用户在 AB 设备中按习惯把点位地址填成数字（如 0）、名称填标签名（point_1），而 AB 行为注册 tag 的键是 `address or name`（地址优先），导致按名称寻址的汇川 Demo 读 `point_1` 全部 miss（0x04）。同时 0x4B 读应答的值此前固定按 4 字节打包，与 BOOL(0xC1, 1 字节)/INT16(0xC3, 2 字节) 等类型码不匹配，客户端按类型码取值会错位。
+
+- **server.py**：`_resolve_behavior_key` 追加 `_tag_alias`（点位名 → tag）大小写不敏感回退匹配，地址填数字时按名称寻址也能命中；0x4B 读应答的值改为按类型码对应尺寸打包（1/2/4/8 字节，float64 用 `<d`）
+- 本地复现用户配置验证：point_1（地址 0、BOOL）读命中并返回 1 字节值，不存在的标签仍正确回 0x04；AB 相关 45 项测试全绿
+
+## v1.6.38 — 2026-10-22
+
+### Fixed — AB/EIP：空帧握手改为标准 I/O 心跳回送，解除汇川 Demo"扫描失败"卡死（用户实测反馈）
+
+v1.6.37 后用户复测仍卡死，新日志证实 v1.6.37 已生效（0x0E 应答 `8e 01 00 00`）且服务端行为与早期可用抓包逐字节一致，但 Demo 在 Forward Open 重连后仍重发心跳然后放弃。结合"扫描失败"提示与 Demo 的"清理标签信息(缓存)"机制分析：早期可用抓包中 DLL 残留连真机时的标签缓存，跳过了扫描握手；缓存清空后每次读都要走扫描阶段，而扫描阶段的空帧握手此前回的是错误帧 `80 08 00 00`，Demo 不认，超时即报"扫描失败"。
+
+- **server.py**：服务码 0x00 的 2 字节空帧（null/null 心跳）改为标准 I/O 心跳应答——同连接、同 seq 回送空数据帧 `00 00`，不再回错误帧
+- 回放验证：心跳 seq 回显正确、0x4B 读路径不受影响；AB 相关 45 项测试全绿
+
+## v1.6.37 — 2026-10-22
+
+### Fixed — AB/EIP：0x0E 扫描应答状态码回退 14→01，解除汇川 Demo 空帧握手卡死（用户实测反馈）
+
+v1.6.36 恢复握手帧应答后用户复测仍失败。将 v1.6.34 前后两份用户抓包逐帧对齐，发现服务端应答的唯一差异是 Get_Attribute_Single (0x0E) 扫描应答的状态码：旧版回 `8e 01 00 00` 时 Demo 重连后直接发出 0x4B 标签读（链路可用）；v1.6.34 起改为"规范"的 `8e 14 00 00`（属性不支持）后，Demo 进入空帧握手分支——重试 Forward Open 后仅重发心跳然后放弃，永远发不出读请求。本次将三条路径（RRData / 已连接通道 / UCMM）的 0x0E 应答状态码统一回退为 0x01。
+
+- **server.py**：0x0E 应答状态码 0x14 → 0x01（与实测可用行为一致）
+- 用早期成功抓包的真实帧序列回放验证：RegisterSession → 0x0E(`8e 01 00 00`) → Large Forward Open → 心跳应答(`80 08 00 00`) → 0x4B 标签读应答，全链路 PASS；AB 相关 45 项测试全绿
+
+## v1.6.36 — 2026-10-22
+
+### Fixed — AB/EIP：撤销已连接通道握手帧静默丢弃，解除汇川 Demo 卡死（用户实测反馈）
+
+v1.6.34 把 I/O 型连接的周期数据/心跳帧（服务码 0x00）改为静默丢弃，但用户实测日志对比发现：汇川 EIP Demo 建立 Large Forward Open 后会先发一个 seq=1 的 2 字节空帧（`01 00 00 00`）作为连接握手，**收到 T→O 上的任何应答后才会继续发送标签读请求**；静默丢弃让 Demo 卡在握手阶段重试约 12 秒后放弃重建连接，永远发不出读请求（0x4B / 0x4C 均不会出现）。本次撤销静默丢弃，恢复为按未知服务返回 `80 08 00 00` 错误应答——与修复前实测能驱动 Demo 进入读请求阶段的行为一致。
+
+- **server.py**：`_handle_send_unit_data` 移除 `service == 0x00` 静默返回，未知服务码统一回错误帧
+- 附带回归验证：握手帧有应答、0x4C 标准读不受影响、0x4B / 0x0E 路径正常
+
+若更新后 Demo 仍读不到数据，请再次导出调试日志（此时应能看到 0x4B 或 0x4C 读请求）用于校准应答格式。
+
+## v1.6.35 — 2026-10-22
+
+### Fixed — Windows 安装器/快速启动：venv 存在但已损坏时自动重建（用户实测反馈）
+
+用户关机重启后重新运行安装脚本报 `did not find executable at ...WindowsApps\PythonSoftwareFoundation.Python.3.13_...\python.exe`，"[错误] Python 核心依赖安装失败"。根因：venv 最初由 Microsoft Store 版 Python 创建，商店版自动更新/卸载后基础解释器路径失效，venv 的 python.exe 启动器指向不存在的解释器（报 "did not find executable / No Python at ..."）。原 install.bat（installer.py）与 quickstart.bat 都只判断 venv 目录是否存在、从不验证可用性，损坏的 venv 让后续 ensurepip / pip install 全部失败且永远无法自愈。本次：
+
+- **installer.py**：确定 venv 路径后先探测 `python.exe -c "import sys"`，失败（含不可执行异常）即删除 venv 并用当前 Python 重建，重建失败给出明确指引
+- **quickstart.bat**：Step 2 增加同样的健康检查，损坏时先删后建
+- **检测陷阱修复**：实测损坏的 venv 启动器在 cmd 下把输出重定向到 nul 设备时返回码会变成 0（检测失效），探测输出必须写入日志文件才返回真实非零码；Python subprocess 路径不受此影响
+
+以复刻用户故障的损坏 venv（pyvenv.cfg home 指向已卸载的 Store Python）实测：损坏场景自动检测→重建→依赖可用；健康场景不误重建。
+
+## v1.6.34 — 2026-10-22
+
+### Added — AB/EIP：支持汇川 EIP Demo 的 Execute_PCCC（0x4B）标签读写（用户实测报文分析）
+
+汇川 EIP Demo（厂商 ID 0x067C）连接 ProtoForge AB 模拟器时，会话注册与 Large Forward Open 均成功，但"扫描标签信息失败 / 读取请求 失败 标签名:xxx"。据用户导出的 debug 报文解码定位根因：汇川 Demo 的标签访问不走标准 CIP 符号化读写（0x4C/0x4D，Kepware 等客户端使用），而是走 **Execute_PCCC（0x4B）**——已连接通道载荷直接携带 UTF-8 标签名（如「允许放货」），原实现落入兜底分支回「服务不支持」（0xCB 状态 0x08）。本次：
+
+- **Execute_PCCC 支持**：已连接通道、SendRRData、UCMM 内层分发三条路径均支持 0x4B。按实测报文格式解析 `[服务][路径][载荷长度 UINT][标签名 UTF-8][可选写值]`：无写值时按标签查点返回值（类型码 + 4 字节小端，bool/string 单独编码）；载荷后带值时执行写入并走与 CIP Write 同源的引擎写入冻结链路；标签未命中返回规范的 0xCB/0x04 错误（原逻辑会把未知标签读成 0）。响应格式无公开规范，按请求镜像构造，待真实抓包进一步校准
+- **Get_Attribute_Single（0x0E）**：汇川 Demo 启动即发的查询由畸形通用错误改为规范 CIP 错误帧（状态 0x14）
+- **I/O 心跳静默**：I/O 型连接的周期数据/心跳（无服务码的 2 字节载荷）原被误判为服务 0x00 回错误帧，现按真实从站行为静默丢弃不响应
+
+标准 CIP 符号化客户端（Kepware、pylogix 等）行为不受影响。以用户导出的真实报文字节回放验证 8 项场景（中文标签读 / bool 读 / 写入回读 / 未知标签拒绝 / 心跳静默 / 0x0E / CIP 读回归 / Forward Open 回归）全部通过；既有 AB 回归测试 11 项通过。
+
+## v1.6.33 — 2026-10-21
+
+### Fixed — 协议高级配置的 boolean 参数误判与交互（用户实测反馈）
+
+汇川 EIP 主站对接 AB 模拟排查时需要打开 raw_frames 报文日志，用户在协议「高级配置」弹窗里找不到该开关——它被渲染成了普通文本框，且填 `false` 关闭时因"非空字符串即视为开"被误判为开启。两处修复：高级配置弹窗的 boolean 字段改为真正的 true/false 下拉开关（回显兼容旧版本遗留的 "true"/"false" 字符串配置）；AB 服务端对 raw_frames 增加容错解析（布尔/字符串 "true"/"1"/"on"/"yes" 均可识别，"false"/"0"/空串正确视为关闭），与 FANUC 侧既有实现一致。
+
+## v1.6.32 — 2026-10-19
+
+### Fixed — Modbus TCP：扫描周期超过 30 秒的客户端被周期性断连，采集值反复变成"坏质量"（用户实测反馈）
+
+用户以 Kepware 采集 ProtoForge 模拟的 Modbus TCP PLC，经 OPC UA 订阅读到的值每隔约 2 分钟在 None（坏质量）与正常值之间交替。根因：原生帧处理器对**每个请求之间**的空闲等待都套了 30 秒超时，扫描周期长于 30 秒的客户端（Kepware 低速扫描等）会被服务器周期性主动断连——采集端表现为标签质量周期性 BAD（OPC UA 订阅读到 None），重连后恢复几个周期再断，反复交替。现改为：仅对连接后的**首个请求**保留 30 秒超时（防慢速连接占用），已建立会话的请求间空闲上限放宽到 1 小时，覆盖绝大多数低速扫描场景。
+
+已以真实 socket 端到端验证：同一 TCP 连接读取 → 空闲 35 秒（超过旧版 30 秒阈值）→ 同连接再次读取，第二次读取成功且寄存器值正确；旧版本在 30 秒即断连。附带确认本问题不是 Kepware 或 OPC UA 侧的缺陷——坏质量是 Kepware 设备层读失败（连接被模拟器关闭）的下游表现。
+
+## v1.6.31 — 2026-10-18
+
+### Fixed — HTTP：编辑设备后 API 前缀被改成 /api/v1 导致全部 Not Found（用户实测反馈）
+
+v1.6.28 修复了"编辑设备后 404"的前缀容错，但用户实测仍复现：编辑设备后浏览器访问 `/api/{设备ID}/temperature` 返回 `{"error": "Not Found"}`（设备前缀级 404，而非点位级），且用户观察到"API 地址自动多了个 v1"。根因与 v1.6.25 的端口三来源问题同源——`api_prefix` 有三个互不一致的默认值来源：设备编辑弹窗的 usage 默认值 `/api/v1`、协议 schema 默认值 `/api`、后端创建兜底 `/api/{设备ID}`。编辑弹窗把 defaults 预填进表单后随表单一起保存，设备被重新注册为前缀 `/api/v1`，原 URL 全部失配。本次从三处根治：
+
+- **前端（根因）**：设备编辑弹窗不再把 defaults 预填进待保存对象，仅回显设备已有配置，未设置字段以 placeholder 提示默认值；保存时丢弃"与默认值相同且原配置中不存在"的键，杜绝任何协议的默认值被固化进配置
+- **默认值统一**：usage 默认值 `/api/v1` → `/api`，与 schema 默认值一致
+- **历史污染数据兼容**：后端注册设备时将精确为 `/api/v1` 的前缀重映射为标准兜底 `/api/{设备ID}` —— 已被污染的设备**升级后无需改任何配置**，原 URL 自动恢复（已验证）；用户自定义的其它前缀不受影响
+
+修复后以真实 HTTP 请求验证 9 项场景（原始/污染/干净/显式默认/自定义前缀/写值回归），全部通过。
+
+## v1.6.30 — 2026-10-18
+
+### Fixed — 未配置密码时启动日志出现自相矛盾的"弱密码"告警（用户实测反馈）
+
+用户首次 Docker 启动后日志先提示「已生成随机密码并保存到 data/.admin_password」，紧接着又报「Admin password is weak or default」，自相矛盾、误以为密码没生效。根因是启动安全检查把"配置密码为空"也当作弱密码告警，但空配置实际走的是随机强密码生成路径（token_urlsafe(16)）。现仅对显式设置的 admin/admin123 弱密码告警；随机生成路径提示不变。随机密码本身出于安全考虑不会出现在日志中，仍保存在 `data/.admin_password` 文件（容器内可 `docker exec protoforge cat /app/data/.admin_password` 读取）。
+
+## v1.6.29 — 2026-10-18
+
+### Added — Docker 部署"连不上协议端口"自诊断提示（社区反馈，同类咨询第 3 次）
+
+用户在 Docker 中部署后内置诊断全绿，但外部上位机工具连接协议端口超时——根因是诊断在后端（容器内）执行，只能证明容器内可达，无法验证宿主机端口映射（-p / ports）。本次让平台自己把这类坑提示出来：
+
+- **连接诊断新增警示项**：后端检测到容器内运行时（/.dockerenv、/run/.containerenv、PROTOFORGE_IN_CONTAINER 环境变量、/proc/1/cgroup），诊断结果追加「检测到 Docker 容器内运行」琥珀色 ⚠ 提示，说明端口检查均在容器内执行、外部连不上时需确认 -p 端口发布与宿主机防火墙；总体横幅同步区分「全部通过 / 通过但有提示 / 有未通过」三态
+- **连接指南附端口发布片段**：容器内部署时设备连接指南在容器提示下方直接给出可复制的参数——`docker run ... -p 102:102` 与 docker-compose ports 写法，UDP 协议（BACnet/FINS/CoAP）自动带 /udp 后缀，GB28181 同时给出 TCP+UDP 两条
+- 新增 `protoforge.core.netutils.in_docker()` 检测函数（Windows 宿主机恒为 False）与配套单元测试
+
+## v1.6.28 — 2026-10-17
+
+### Fixed — HTTP 协议：编辑设备后全部 404 + PUT 写值 404（用户实测反馈）
+
+用户实测两个问题：① 只要编辑一次设备，HTTP 接口全部 404——根因是设备编辑弹窗保存时协议配置被 schema 默认值覆盖（api_prefix 从 `/api/{设备ID}` 变为 `/api`），而服务端不剥离路径中的设备 ID 段；② GET 正常但 PUT 404——空请求体时错误落到"Point not found"兜底，误导排查方向。修复：
+
+- **路由容错**：前缀不含设备 ID 段时自动剥离路径中的 `{设备ID}` 段，`/api/{设备ID}/temperature` 与 `/api/temperature` 两种形式均可用，编辑设备不再破坏旧 URL
+- **按测点地址匹配**：URL 同时支持测点名称与地址（此前测点列表展示的地址 `/sensor/temperature` 按访问永远 404，只认名称）
+- **PUT/POST 写值兼容**：除 JSON 请求体 `{"value": x}` 外，新增 URL 查询参数写值 `?value=x`（兼容 HslCommunication 等 .NET 客户端）；支持 `Expect: 100-continue` 中间响应；均缺失时返回 400 明确提示而非误导性 404；查询参数按测点类型安全转换，非法 JSON 返回 400
+- **附带修复**：`protoforge/win_service.py` 两处函数体缩进缺失导致的 IndentationError（Windows 服务安装功能模块无法导入，属既有问题）
+
+修复后以真实 HTTP 请求验证 14 项场景（创建/编辑前后路由、名称与地址匹配、五种写值方式、错误码），全部通过；全量测试套件 1266 通过无回归。
+
+## v1.6.27 — 2026-10-17
+
+### Added — GitHub Release 正文自动携带 CHANGELOG 内容
+
+此前 tag 推送后自动创建的 Release 正文只有一行 "Full Changelog" 对比链接。现在 Desktop Portable Build 工作流在挂载便携包前，会从 CHANGELOG.md 自动截取对应版本段落（含中文更新说明）写入 Release 正文，未匹配到版本段落时回退为 CHANGELOG 链接。截取逻辑已用 v1.6.24 / v1.6.26 / 不存在版本三种情况本地验证。
+
+## v1.6.26 — 2026-10-17
+
+### Added — 全局弹窗拖拽（用户反馈）
+
+用户反馈"所有弹出的窗口不支持拖动，影响视线"。naive-ui 的 Modal 原生不支持拖拽，本次在 App.vue 增加全局委托监听：按住任意弹窗的头部标题区域即可拖动，关闭按钮/按钮/输入控件不误触；位移用 position:relative + left/top 实现，不碰 transform，不破坏 naive-ui 的进出场缩放动画。头部显示抓手光标提示可拖。已用真实浏览器验证：拖拽位移生效、弹窗关闭无回归。
+
+### Fixed — HTTP 协议 404 排查指引澄清（用户反馈）
+
+用户用 HslCommunication 客户端 POST HTTP 设备返回 404 误以为"不支持 POST/PUT"。实际 HTTP 协议完整支持 GET/POST/PUT/DELETE/OPTIONS，404 的原因是 URL 拼接规则：**完整路径 = 设备的 API Path Prefix + 点位地址**（如 prefix=/api/v1、点位地址=/sensor/temperature，则完整路径为 /api/v1/sensor/temperature）。设备编辑弹窗中 API Path Prefix 为灰色占位符时表示未显式设置，实际前缀以模板自带配置或设备详情页示例 URL 为准，勿以占位符猜测。
+
+## v1.6.25 — 2026-10-17
+
+### Fixed — 协议服务卡片与高级配置弹窗端口显示不一致（用户反馈）
+
+用户反馈：Modbus TCP 实际运行在 5020，"高级配置"弹窗却显示 502。根因是**三处端口来源各说各话**：卡片显示注册表默认端口（从不反映运行值），弹窗回显引擎记录的启动配置（空配置一键启动时为空字典，回退到 schema 默认值），而 schema 默认值本身也可能与实际监听端口不一致（协议内部自动换端口时）。修复：引擎 `get_protocols()` 现合成"实际生效配置"——schema 默认打底 → 用户启动配置覆盖 → 实际监听端口（actual_port）最终权威，新增 `effective_port` 字段；前端卡片运行中时显示生效端口而非注册表默认值。弹窗回显与卡片显示从此同源。已验证三场景：显式 502 启动回显 502、改 5020 重启同步更新、空配置启动回显实际默认 5020。另：本次同步重新构建 web/dist（此前 dist 停留在 v1.6.18，从源码 zip 部署的用户会看到旧版前端行为）。
+
+## v1.6.24 — 2026-10-14
+
+### Added — 点位自动化控制 API 文档（社区反馈）
+
+社区用户反馈"自动化控制 PLC 点位没啥文档"。新增 docs/点位自动化控制.md：登录鉴权、点位读写（含 bool 落线圈区、类型钳制、错误码表）、写入 / Force / Reset 三者区别对照、故障注入 API、状态机控制、control-loops 自动回路、pytest/CI 集成示例、定时变化脚本、常见坑速查。文档中全部 API 示例均经真实调用验证，并修正三处易踩坑细节（quick-create 须传 template_id、引擎启动预热期返回 503、点位元数据在 /config 而运行值在 /points）。另：README 新增二维码图（推广用）与文档入口链接；docker-compose.simple.yml 镜像 tag 同步至 1.6.24。
+
+### Fixed — 版本检查显示"当前 0.1.0"而非实际版本（用户反馈）
+
+用户反馈界面版本检查弹窗显示"发现新版本 v1.6.23（当前 0.1.0）"，但左下角正确显示 v1.6.23。根因：`system_routes.py` 的 `_get_version()` 优先使用 `importlib.metadata.version("protoforge")`，而 editable install（`pip install -e .`）的 dist-info 元数据可能是陈旧的 `0.1.0`（hatchling 已知问题）。修复：**优先使用 `protoforge.__version__`（单一事实源），`importlib.metadata` 仅作兜底**，与 `scripts/build_desktop.py` 的 `get_version()` 逻辑保持一致。
+
+## v1.6.22 — 2026-10-14
+
+### Fixed — 严重数据丢失 Bug：启动时删除大 WAL 导致设备丢失（便携包用户实测定位）
+
+便携包用户反馈：新建设备后关闭程序重启，设备全部丢失，数据库 devices 表为空。用户数据库直查定位到根因：`db/session.py` 的 WAL 恢复逻辑中存在"WAL 文件大于主库 10 倍即删除 WAL"的错误判断——本项目写入模式下（checkpoint 少）WAL 大于主库是**正常状态**而非损坏，删除 WAL 会毁灭所有未 checkpoint 的已提交数据。桌面模式主库长期只有几 KB 而 WAL 数百 KB，必然触发。
+
+修复：① 彻底移除删除 WAL 的逻辑——SQLite 打开时自带 WAL 重放与损坏帧处理，删除 WAL 永远是错的，大 WAL 仅记录 INFO 日志；② 周期性被动 checkpoint（每 60 秒）保持 WAL 体积有界、主库数据实时；③ 保留启动时 wal_checkpoint 恢复与 integrity_check。验证：建设备 → 3 秒内强杀进程（模拟直接关窗口）→ 重启，设备完整存活。此 Bug 自 v1.6.0 便携包起即存在。
+
+## v1.6.10 ~ v1.6.14 — 2026-10-12/13
+
+### Fixed — Windows 启动链路战役（裸机 Win11 LTSC 实测反馈驱动）
+
+用户在裸机 Win11 LTSC 上启动连番踩坑，逐层修复：
+
+1. **quickstart 防闪退**（v1.6.10）：父进程捕获子脚本异常退出码并展示日志；Microsoft Store 假 python 别名检测；服务启动前导入预检——瞬间崩溃的真实堆栈直接显示；
+2. **install.bat 路径修复**（v1.6.11）：先 cd 到脚本所在目录，修复 installer.py 找不到的问题；缺文件时明确指引便携包/源码包的正确用法；
+3. **版本自报**（v1.6.12）：启动时打印代码版本号，用户截图即可自证代码新旧；
+4. **cmd AutoRun 防御**（v1.6.13）：部分国产软件往 cmd AutoRun 注册码页切换，子进程入口再强制 chcp 65001；
+5. **.bat 行尾总根因**（v1.6.14）：仓库内 .bat/.cmd/.ps1 此前以 LF 行尾存储，zip 下载不转换行尾，cmd 解析 LF 批处理会错乱（碎片命令/乱码/闪退的总根源）。新增 .gitattributes 强制 .bat/.cmd/.ps1 CRLF 检出；
+6. 完整版 compose 补 cap_add NET_BIND_SERVICE（S7/IEC61850 特权端口 102）；install.bat 增加"以管理员运行导致个人目录 Python 不可见"提示。
+
+## v1.6.8 / v1.6.9 — 2026-10-12
+
+### Fixed — AB (EtherNet/IP) 与 Kepware 深度兼容（用户 raw_frames 帧捕获定位，实测闭环）
+
+群友用 Kepware (Allen-Bradley ControlLogix Ethernet 驱动) 连接报 "Frame received contains errors / Unable to retrieve the identity"，经六轮修复、最终以其 raw_frames 实抓帧回放验证闭环（v1.6.9）：
+
+1. **CIP 错误帧格式**：标准应为 [服务|0x80][状态][附加状态长度 UINT]，原实现多发 4 字节畸形帧；
+2. **tag 跨设备路由**：原实现只查默认设备的点位表，多设备部署时非默认设备 tag 全部 0x04；
+3. **已连接通道服务分发**：身份查询/属性列表/批量读补齐 SendUnitData 路径；
+4. **0x52 双语义**：区分 Connection Manager 的 Unconnected Send 与 Read Tag Fragmented；
+5. **UCMM 完整格式**（实测帧定位）：CM 路径后含 priority/timeout 各 1 字节，内层支持 Large Forward Open (0x55)/Forward Close (0x4E) 分发——Kepware 把建连请求也包在 UCMM 里；
+6. **MSF 偏移基准**：Multiple Service Packet 偏移从 count 字段起始处计算（pycomm3 与实测 Kepware 帧双确认），原实现按偏移表之后计算导致批量读整体截错位；
+7. **ListIdentity 规范重写**：版本 UINT、socket 地址布局、State 字节逐项对齐；
+8. **高级配置暴露 raw_frames 开关**，收发帧 16 进制日志便于客户端兼容性排查。
+
+验证：真实 Kepware 帧回放（UCMM 建连/MSF 批量读）+ pylogix 连接读写 + 11 项 AB 单元测试全绿。Kepware 已可正常读取仿真数据。
+
+## v1.6.7 — 2026-10-11
+
+### Fixed — 桌面模式 exe 在不同机器上 API 路径不一致（用户反馈）
+
+用户反馈在虚拟机上打包的 ProtoForge.exe 拷到主机和虚拟机运行时，HTTP API 路径不一致——主机有 `/api/v1` 前缀，虚拟机没有。根因和修复：
+
+1. **桌面模式未同步 `PROTOFORGE_PORT` 环境变量**：`run_desktop()` 使用端口 18080 启动 uvicorn，但没有设置 `PROTOFORGE_PORT` 环境变量。`config.Settings` 从 `.env` 文件读取 `PROTOFORGE_PORT`（可能是 8000），导致 `settings.port` 与实际监听端口不一致。这会影响 CORS 默认 origins、系统设置页面显示的端口号、协议端口冲突校验等逻辑。修复：在 `run_desktop()` 中设置 `os.environ["PROTOFORGE_PORT"]` 和 `PROTOFORGE_HOST` 为实际值，使 Settings 能正确反映桌面模式的端口配置。
+
+2. **缺少源码模式实例冲突检测**：如果虚拟机上同时运行了源码模式（端口 8000）和桌面模式（端口 18080），用户可能在浏览器中混淆访问的实例。修复：桌面模式启动时检测 8000 端口是否已有服务运行，如有则输出提醒信息。
+
+3. **`__init__.py` 版本号与 `pyproject.toml` 不一致**：`pyproject.toml` 已更新到 1.6.6 但 `__init__.py` 仍为 1.6.3。修复：同步为 1.6.7。
+
+## v1.6.6 — 2026-10-11
+
+### Fixed — Win11 裸机环境 quickstart.bat 启动失败（用户反馈）
+
+用户反馈在 Win11 23H2 虚拟机裸机环境（Python 3.12.0 + Node.js v20.19.4）下运行 quickstart.bat 启动失败。根因分析和修复：
+
+1. **pip 安装输出完全静默导致无法定位失败原因**：`pip install -e ".[all]" >nul 2>&1` 把所有输出和错误都吞了，用户看不到安装失败的具体原因。修复：移除静默标记，让安装过程输出可见。
+
+2. **依赖安装顺序不合理**：原脚本先尝试 `.[all]`（包含 grpcio/cryptography/asyncpg 等 C 扩展大包），失败后才回退到核心依赖。在裸机/慢网络环境下 `.[all]` 容易超时或编译失败，而核心依赖（Modbus/HTTP/GB28181 等 17 种协议无需额外依赖）可以正常工作。修复：**先装核心依赖保证服务能启动**，再尝试 `.[all]` 作为可选升级，失败不阻止启动。
+
+3. **缺少 `ensurepip` 步骤**：全新 venv 中 pip 可能版本过旧或不可用。修复：添加 `ensurepip --default-pip` 步骤。
+
+4. **缺少数据库迁移步骤**：首次运行时未执行 `alembic upgrade head`，可能导致数据库表结构不匹配。修复：在启动前添加数据库迁移步骤（非致命，失败时自动降级为自动建表）。
+
+5. **install.bat 的 `chcp 65001` 无 UTF-8 重启修复**：Win11 CMD 在 `chcp 65001` 后同一文件后续行可能被错误解析。修复：采用与 quickstart.bat 相同的 UTF-8 重启修复方案。
+
+6. **启动失败时缺少排查提示**：原脚本只显示"启动失败"，不告诉用户如何排查。修复：添加常见原因提示（端口占用、依赖未装全、数据库损坏）。
+
+## v1.6.5 — 2026-10-11
+
+### Fixed — EdgeLite 未配置时协议启动产生大量 WARNING（深度审计发现）
+
+`_on_protocol_status` 事件处理器缺少 `_enabled` 检查，导致即使 EdgeLite 完全未配置，每次协议启动仍会尝试推送所有受影响设备并记录 WARNING。修复：
+
+1. 在 `_on_protocol_status` 开头添加 `if not self._enabled: return` 检查，与其他事件处理器（`_on_device_created` 等）保持一致。
+2. 在 `push_device` 返回 `skipped` 时（EdgeLite 未配置/协议不支持/已在推送中），将日志级别从 WARNING 降为 DEBUG，避免不必要的日志噪音。
+
+## v1.6.4 — 2026-10-11
+
+### Fixed — Demo 模式启动时大量 WARNING 日志刷屏（自检发现）
+
+用户日志分析发现 demo 模式启动后每个 tick 周期产生数十条 WARNING，严重影响日志可读性和用户信心。根因三处，全部修复：
+
+1. **S7 demo 设备地址使用纯数字（"0"、"1"、"3"）**：S7 地址解析器不认识纯数字格式，每次创建设备都输出 "S7 address '0' not recognized, defaulting to DB1 offset 0" 警告。修复：全部改为标准 S7 地址格式（DB1.DBX0.0、DB1.DBD2 等），同时 S7 解析器增加纯数字 → DB1 字节偏移的兼容处理（与 S7-Plus 解析器行为一致），用户填纯数字不再报警告。
+
+2. **场景启动重复调用 device.start()**：`engine.start_scenario()` 先通过 `start_device()` 把设备置入 STARTING 状态，随后 `scenario.start()` 又对所有设备调用 `device.start()`，触发 "No valid transition for event 'start' from state 'starting'" 警告。修复：`scenario.start()` 跳过已在 STARTING/RUN/STOPPING 状态的设备，只对 STOP/ERROR 状态的设备触发 start。
+
+3. **bool 报警点位 `alarm` 配置 `min_value=0, max_value=0`**：规则引擎写 `True` 到该点位时，虽然 bool 类型已跳过范围检查，但 `min=0, max=0` 的配置本身不合理（bool 点位不应该有数值范围限制）。修复：移除 min/max，改为 `fixed_value=False`。
+
+### Fixed — S7 地址解析器兼容纯数字输入
+
+S7 地址解析器此前对纯数字地址（如 "0"、"2"）输出 WARNING 并默认到 DB1 offset 0，现在正确解析为 DB1 的字节偏移（与 S7-Plus 协议解析器行为一致）。用户使用纯数字作为 S7 地址时不再产生警告日志，且地址偏移正确递增。
+
+## v1.6.3 — 2026-10-10
+
+### Fixed — GitHub Actions Docker 构建失败（aarch64 wheel 404）
+
+阿里云 PyPI 镜像同步滞后导致 `cryptography` 包的 aarch64 wheel 404。Dockerfile 改用官方 PyPI 源。
+
+### Fixed — Windows 环境编码崩溃
+
+`subprocess.run` 在 Windows 下默认使用 GBK 解码 UTF-8 输出导致 `UnicodeDecodeError`。`installer.py` 和 `win_service.py` 显式指定 `encoding="utf-8"`。
+
+### Fixed — bool 点位被范围检查截断
+
+`True`（1.0）超出 `[0, 0]` 范围被截断为 0.0。`device.write_point()` 对 bool 类型跳过数值范围检查。
+
+### Fixed — HTTP REST 示例代码路径错误
+
+连接指南中 HTTP REST 协议的示例代码 api_prefix 与实际服务端路由不一致。修正 defaults.py 中的示例路径。
+
+### Improved — 前端设备弹窗宽度与数值精度
+
+设备弹窗宽度扩大至 960px，增加 device_id 点击复制功能，float32 数值显示精度优化（<100 显示 4 位小数，≥100 显示 2 位小数）。
+
+### Improved — quickstart.bat 防闪退
+
+`quickstart.bat` 末尾增加无条件 `pause`，防止服务停止或启动失败时窗口闪退。
+
+## v1.6.1 — 2026-10-08
+
+### Fixed — 内置 Modbus 模板点位地址重叠
+
+新增的点位地址重叠检测上线后，实例化内置 Modbus 模板报 400「实例化失败」。根因是 8 个内置模板的多字节点位（float32/int32 占 2 个寄存器）地址间隔只有 1，互相覆盖。已重排全部 8 个模板（gas_detector / generic_plc / plc_controller / temp_sensor / vfd / modbus_rtu 版 plc_controller、power_meter、temperature_sensor）的地址，全部通过重叠检测与 PointConfig 模型校验。已部署用户更新后重启即可用新地址实例化（历史设备数据不受影响）。
+
+### Fixed — AB (EtherNet/IP) 与 Kepware 兼容性
+
+Kepware 以 Allen-Bradley ControlLogix Ethernet 驱动连接时报 "Unable to retrieve the identity / Frame received contains errors" 并降级 Symbolic Protocol。根因是 AB 服务端缺少 Kepware 依赖的 CIP 服务：EIP ListServices (0x0004)、Get_Attribute_List (0x03，读 Identity Object 设备身份)、Multiple Service Packet (0x0A，批量读写)、Read/Write Tag Fragmented (0x52/0x53，按普通读写处理)。另修复 tag 大小写敏感问题（客户端常把 PROGRAM:MAIN.CPULOAD 全大写发送，点位地址是 Program:Main.CpuLoad）。已用 pylogix（已连接读写）与自研裸 EIP 客户端（ListServices / Get_Attribute_List / MSF / 未连接读）双客户端实测通过。
+
+## v1.6.0 — 2026-10-05
+
+### 🖥️ Windows 桌面版（升级规划 v1.6.0"双击就能用"专项）
+
+**新增 — 桌面模式 `protoforge desktop`：**
+
+为无 Python/Node/Docker 的工控现场 Windows 机器设计的一键使用形态：
+
+- 后台线程启动与 `protoforge run` 完全相同的服务（同一 app、同一配置链路），就绪后**自动打开管理界面**；
+- **重复双击 = 打开界面**：目标端口上已有健康实例时不再起第二个服务，直接打开已运行实例（单实例语义自然实现）；
+- 端口默认 18080，被占用自动顺延；健康检查 90 秒超时，失败时指向日志文件；
+- 可选**系统托盘**（pystray + Pillow，随 `[desktop]` extra 安装）：菜单"打开界面 / 退出"，托盘气泡提示新版本；未安装时自动降级为纯浏览器模式，Ctrl+C 优雅退出；
+- `--native` 可选 pywebview 原生窗口（未安装自动回退浏览器——v1.6.0 取浏览器为主形态：工控现场零依赖、无 WebView2 兼容问题、打包体积与杀软误报更可控）；
+- **冻结模式数据随 exe 走**：chdir 到 exe 目录，data/、logs/、.env 全部落 exe 旁，便携包解压即用、配置可整体拷贝迁移。
+
+**新增 — 路径解析基础设施 `protoforge/core/paths.py`：**
+
+开发 / PyInstaller 冻结双模式统一：静态资源解析顺序 `PROTOFORGE_STATIC_DIR` 环境变量 > bundle 内 web/dist（`sys._MEIPASS`，onedir 即 `_internal/`）> 仓库根 web/dist（开发模式不变）；`app_root()` 冻结模式返回 exe 目录。`main.py` 静态挂载与 `doctor` 改走该模块（Docker 部署行为不变）。
+
+**新增 — Windows 服务模式 CLI 化：**
+
+`protoforge install-service` / `uninstall-service`（`protoforge/win_service.py`）：与 v1.5.0 的 `scripts/install_service.bat` 同一套 NSSM 语义（开机自启 SERVICE_AUTO_START、崩溃自动拉起 AppExit→Restart、日志轮转 10MB），但 **pip 安装位置也能用**（不要求仓库 checkout）；管理员权限与 NSSM 定位（PATH → tools/nssm.exe）带明确提示。参数构建为纯函数，跨平台可测。
+
+**新增 — 桌面便携包构建：**
+
+- `protoforge.spec`：PyInstaller onedir 打包（前端 web/dist、133 个设备模板 JSON、协议 extras pymodbus/asyncua/amqtt、uvicorn 动态导入段全部随包）；onedir 优于 onefile——秒级启动 vs 半分钟解压，杀软误报更少；保留控制台窗口（首次启动的管理员密码打印在控制台）。
+- `scripts/build_desktop.py`：一键构建 + 产出 `dist/ProtoForge-v<版本>-win64-portable.zip`，内置规划验收线（zip ≤ 300MB）自动检查。
+- `scripts/desktop_entry.py`：冻结入口——双击 exe 默认进桌面模式，`ProtoForge.exe doctor` 等子命令原样透传。
+
+**改进 — 版本检查提取复用：**
+
+v1.4.0 内嵌在 `/system/version-check` 的 GitHub Releases 检查逻辑提取到 `protoforge/core/version_check.py`（`fetch_release_info` + TTL 缓存类），API 端点行为不变（10 分钟缓存 + 鉴权），桌面模式复用同一实现。
+
+### 升级提示
+
+- 桌面用户：下载 `ProtoForge-v1.6.0-win64-portable.zip` 解压双击 `ProtoForge.exe` 即可（或源码构建：`python scripts/build_desktop.py`）；
+- 服务用户：除既有 `scripts/install_service.bat` 外，现可用 `protoforge install-service`；
+- Docker 用户：`docker pull suoten/protoforge:1.6.0`，行为无变化。
+
+## v1.5.0 — 2026-10-05
+
+### 🛡️ 质量护城河（升级规划 v1.5.0"可信"专项）
+
+**新增 — Wire 级协议黄金用例回归体系（10 协议 / 43 用例，CI 合并门禁）：**
+
+针对 v1.4.x 的 IEC 104 帧格式回归事故建立的系统性防线：用**按协议标准原文构造的字节级黄金帧**与真实 socket 上的服务端响应逐字节对比，动态字段（事务号/PDU 引用/invoke ID）由客户端指定，期望帧完全确定。覆盖 Modbus TCP/RTU（桥接）、S7（COTP CR→CC/Setup Comm/Read Var/Write Var）、IEC 104（既有 7 例）、DL/T 645、CJ/T 188、MC(SLMP)、FINS（TCP 握手/内存读写/控制器读）、MQTT（连接/订阅/发布契约/心跳）、BACnet（Who-Is→I-Am/ReadProperty/WriteProperty/Error）、OPC-UA（HELF→ACKF/垃圾帧拒绝）。CI 新增 `wire-golden-gate` job（**不可豁免**）。
+
+黄金用例上线第一天即抓到并修复 **3 个真实 wire 级缺陷**：
+
+1. **Modbus RTU 桥接 count=0 返回正常响应**（`03 00`）：规范（Modbus V1.1b3）要求返回异常码 03（ILLEGAL DATA VALUE），TCP 服务端是对的、RTU 桥接漏了 count==0 校验（FC01/02/03/04 全部补齐）
+2. **MC(SLMP) 字设备偏移错位**：字编号被直接当字节偏移，D100/D101 相邻两个字互相覆盖（多字读返回 `34 78 56 00` 而非 `34 12 78 56`）。修正为标准语义——字设备字节偏移 = 字编号 × 2（读/写/随机读写全路径 + 点位解析同步），位设备 nibble 布局不变
+3. **DL/T 645 广播读表地址在单设备场景永远无响应**：`device_id is None` 条件在单设备时恒假（`_find_device_by_addr` 会匹配唯一设备），而广播读地址恰恰是"不知道表地址"时用的功能。移除该条件，广播读地址按标准返回第一台设备的地址
+
+与 v1.4.4 mewtocol 教训同源：协议实现必须有标准原文/第三方实现的独立验证向量，"自己写的测试通过"不等于"符合协议"。黄金用例即为此建立的长效机制。
+
+**新增 — `protoforge doctor` 环境自检命令：**
+
+把 v1.3.x—v1.4.x 修复过的每类部署问题的诊断逻辑沉淀成一条命令：数据目录可写、核心/可选依赖完整、Web 端口占用、协议特权端口（<1024）提示、协议端口冲突（首跑即发现 iec61850 与 s7 默认都占 102 的既知冲突）、容器环境网络拓扑提示、免认证模式告警。支持 `--json` 机器可读输出（报 issue 附上），error 级问题退出码为 1。
+
+**新增 — 配置链路一致性测试（8 例）：**
+
+v1.4.2"协议端口静默丢弃"事故的通用化防线：`PROTOCOL_DEFAULTS` 每个带端口的协议必须有 Settings 设置项（mewtocol 类事故防线）；port_map 与 Settings 双向一致；`protocol_ports` 字典四层贯通（提交→Settings→defaults→port_map）并持久化到 .env；非法值显式拒绝；**Settings 全字段分类完备性断言**——每个字段必须落在"可更新白名单 / 已知不可更新"两个集合之一，未来新增字段若两边都不挂（即走静默丢弃路径）测试立即红灯。
+
+**新增 — Windows 服务化（NSSM）：**
+
+替代 v1.3.3 脆弱的 VBS 开机自启：`scripts/install_service.bat` 把 ProtoForge 注册为真正的 Windows 服务（开机自启、崩溃自动拉起、日志轮转 10MB），`scripts/uninstall_service.bat` 一键卸载。详见 DEPLOYMENT.md。
+
+### 🔧 改进
+
+- DEPLOYMENT.md 新增「Windows 服务化（NSSM）」与「一键自检 protoforge doctor」章节
+
+### 升级提示
+
+Docker 用户：`docker pull suoten/protoforge:1.5.0`（> 📎 **修订注记（v1.6.0 期补记）**：v1.5.0 未单独打 tag，Docker Hub 无 1.5.0 镜像；本版本全部内容已随 [1.6.0 镜像](https://hub.docker.com/r/suoten/protoforge/tags)提供，请直接 `docker pull suoten/protoforge:1.6.0`）。本版本无破坏性 API 变更；**MC 协议字设备偏移修正**后，此前依赖"错位行为"的自定义客户端需改按标准字编址（标准客户端如 pymcprotocol 无需任何改动）。部署类问题先跑 `protoforge doctor`。
+
+## v1.4.4 — 2026-09-30
+
+### 🐛 Bug Fix（v1.4.2 用户反馈专项）
+
+**修复 — MEWTOCOL 帧格式与标准不符（AI 对照两个独立第三方实现 hiroeorz/mewtocol-go + OpenLogics/MewtocolNet 交叉发现，共 7 处）：**
+
+此前实现是"自证式测试"（用自己发明的格式测试自己），未经真实主站/第三方库验证。逐项修正：
+
+| 项 | 旧实现（错误） | 标准实现（已修正） |
+|---|---|---|
+| BCC 范围 | 不含起始符 `%` | XOR 覆盖从 `%` 到 BCC 前的**全部字符**（含 `%`） |
+| 数据区读 | 自创 `RDDT`+地址+数量 | `RDD`+单字符区码（D/L/F）+5 位**十进制**起始+结束（含首尾，数量=结束-起始+1） |
+| 触点读 | 自创 `RC`+地址+数量 | `RCS`（单点）/`RCC`（字单位，4 位起始+结束），区码 X/Y/R/T/C/L |
+| 触点写 | 自创 `WC` | `WCS`/`WCC`（仅 Y/R/L 输出型区） |
+| 错误响应 | 回显命令+4 位码 | `%STN!`+2 位码，**无命令回显**（21=BCC/22=格式/40=未定义…） |
+| 站号 | 按 16 进制解析 | 2 位**十进制**（01-99），`EE`=全局广播（执行不回应，与真实 PLC 一致） |
+| 字传输序 | 高字节在前（04D2） | **低字节在前**（D204），读写两方向均如此 |
+
+另经 mewtocol-go README 报文向量验证补充一处：响应只回显命令前两字符（RCS→`$RC`、WCS→`$WC`）。全部修正项已用 mewtocol-go README 的真实报文向量（`%01#RCSX00001D` → `%01$RC021`）逐字节互操作验证。
+
+- 测试：`tests/test_mewtocol.py` 全量重写为标准帧（15 例）+ `tests/test_mewtocol_xcheck.py`（3 例，含 README 向量端到端）
+- **教训记录**：新协议实现必须先对照协议原文/第三方实现设计测试向量，再写实现；"自己写的测试通过"不等于"符合协议"。新协议默认接入用户的真实主站软件，帧格式错误要到现场才暴露
+- 感谢群里用户用 AI 对照第三方实现做的交叉审查——这正是我们需要的验证方式
+
+## v1.4.3 — 2026-09-30
+
+### 🐛 Bug Fix（v1.4.2 用户反馈专项）
+
+**修复 — Windows 升级后 OPC-UA 数据不再变化（正弦波/随机数全部冻结）（用户反馈）：**
+
+- 根因：`pyproject.toml` 对 OPC-UA 依赖 asyncua 未设版本上限，用户升级 ProtoForge 时 pip 重新解析装上了 **asyncua 2.0.x**；asyncua 2.0 将 `DataValue` 的 StatusCode 字段由 `StatusCode_` 改名为 `StatusCode`（跟随 OPC UA 结构体 CamelCase 命名），服务端把生成值写入节点的代码在 2.0 下构造 DataValue 即抛 `TypeError: unexpected keyword argument 'StatusCode_'`——而该错误只记 **debug 级日志**，于是所有 OPC-UA 节点值静默停止更新，订阅客户端再也收不到数据变化
+- 修复：
+  - `opcua/server.py` 新增 `_make_datavalue()` 双版本兼容层（自动探测 1.x/2.x 的字段名并缓存，Variant 统一关键字传参），1.1.8 与 2.0.1 双环境真实服务端 + 客户端读值验证通过
+  - 同步错误从静默 debug 升级为"首次 warning、同类降级"（`_report_sync_error`），今后此类故障开日志即可见，不再无感
+  - `pyproject.toml` asyncua 上限封到 `<3.0`（2.x 兼容已验证，3.x 出现后需回归再放开）
+- 回归测试 `tests/test_opcua_datavalue_compat.py`（2 例，双环境执行）：DataValue 构造兼容性、端到端节点值变化
+
+## v1.4.2 — 2026-09-30
+
+### 🐛 Bug Fix（v1.4.1 用户反馈专项）
+
+**修复 — 系统设置 → 协议端口，修改保存不生效（用户反馈）：**
+
+- 根因：前端 `PUT /settings` 以 `protocol_ports` 字典提交（`GET /settings` 也按字典返回），但配置层 `update_settings` 只接受 `{proto}_port` 形式的键——整个字典被**静默丢弃**，界面提示"设置已保存"而实际未入库。API 层白名单与配置层键规则双层不一致
+- 修复：`update_settings` 将 `protocol_ports` 字典展开为逐协议 `{proto}_port` 键，走统一的范围校验、跨协议端口冲突检查与 `.env` 持久化；非数字/越界/冲突给出明确 422 报错
+- 生效时机：保存后协议服务**下次启动/重启**使用新端口（默认端口统一从设置读取）；前端保存后若检测到端口变更，明确提示哪些协议需重启、可到"协议服务"页点"启动"立即应用，避免"改了没反应"的困惑
+
+**修复 — mewtocol（松下 MEWTOCOL）缺失端口默认值与设置项：**
+
+- v1.4.0 新增的第 28 种协议未同步进 `PROTOCOL_DEFAULTS` 与系统设置（`protocol_ports` 共 26 项，无 mewtocol）——不填高级配置直接启动会回退到 8000 端口（与 Web 服务端口冲突，触发自动换端口）
+- 修复：`PROTOCOL_DEFAULTS` 补 mewtocol 条目（标准端口 2049），Settings 模型补 `mewtocol_port`，设置页协议端口列表同步出现该协议
+- 回归测试 `tests/test_settings_protocol_ports.py`（6 例）：字典入库、下次启动生效、冲突拒绝、非法值拒绝、未知协议忽略、mewtocol 条目
+
+## v1.4.1 — 2026-09-30
+
+### 🐛 Bug Fix（v1.4.0 用户反馈专项）
+
+**修复 — IEC 104 帧格式回归（v1.4.0 已携带，标准主站连上即被踢、遥测地址 ×256 复发）：**
+
+- 根因：自动化提交 `1df6f50`（9 月 26 日"联调批次修复"）将 IEC 60870-5-**101**（FT1.2）的帧格式错套到 **104** 上：APDU 长度域被改为 2 字节（L1 L2）、ASDU 头被改为 COT 2 字节 + OA 2 字节（8 字节头）。IEC 60870-5-104 标准为**单字节长度域** + **6 字节 ASDU 头**（TI+VSQ+COT(1)+OA(1)+CA(2 LE)）——该改动不仅让标准客户端（QTester104、lib60870 等）连接即被断开（控制码 0x07 被当作 L2 校验失败），还回退了此前修复 QTester104 遥测地址 ×256 的 COT 1 字节修正（`4f7f803`），等于 v1.4.0 重新带上了用户报告过的原始 Bug
+- 修复：`protoforge/protocols/iec104/server.py` 整体回退到标准实现（`4f7f803` 版本）；回归测试 `tests/test_iec104_wire.py` 7 例全绿（含 STARTDT/时钟同步/总召/遥控选择-执行/时标命令的严格字节级断言）
+- 教训记录：APDU 帧格式 `68 L(1字节) C1..C4`、ASDU 头 6 字节，是 104 与 101 的核心区别之一，后续任何协议格式修改须对照标准原文并跑 wire 回归
+
+**修复 — Docker 镜像启动报 `ModuleNotFoundError: No module named 'greenlet'`（alembic 迁移失败，容器无法启动）：**
+
+- 根因：SQLAlchemy 经由 alembic 间接安装，未显式声明。SQLAlchemy 2.1 起移除了默认的平台级 greenlet 依赖（仅保留 `sqlalchemy[asyncio]` extra），v1.4.0 镜像构建时 pip 解析到 SQLAlchemy 2.1.1 → 容器内缺 greenlet → `alembic upgrade head` 导入 `sqlalchemy.ext.asyncio` 时崩溃
+- 修复：核心依赖显式加入 `sqlalchemy[asyncio]>=2.0.0`，保证任何 SQLAlchemy 版本下 greenlet 随装
+- 顺手修复：`alembic.ini` 含中文注释，Windows GBK locale 下 configparser 解码失败（本地 pip 安装用户执行数据库迁移同样会崩）——改为 ASCII 注释，并保留说明
+
+**修复 — Docker 中启动 S7 协议报 503（"No free port found"，无从排查）：**
+
+- 根因：S7 默认端口 102 是 Linux 特权端口（<1024），容器以非 root 用户（uid 1000）运行，绑定报 PermissionError；旧逻辑把 PermissionError 误判为"端口被占用"，自动换端口又连续撞上 103..1023 的权限墙，最终报 "No free port found in range"（API 503），用户无法理解
+- 修复：引擎在端口占用检测前增加**特权端口预检**——用测试 socket 实际探测绑定，PermissionError 时直接给出可操作提示（`--cap-add NET_BIND_SERVICE` 或改用 1024 以上端口），中英双语；"No free port found" 友好报错映射同步补充根因说明
+- 部署文档与 compose 同步：`DEPLOYMENT.md` Docker run 示例加入 `--cap-add NET_BIND_SERVICE` 并新增特权端口专述；`docker-compose.simple.yml` 加 `cap_add: NET_BIND_SERVICE`（映射了 102 端口的场景必需）
+- 回归测试 `tests/test_privileged_port_precheck.py`（4 例）：权限拒绝→可操作报错、≥1024 端口占用路径不受预检影响、全端口占用仍报 "No free port found"、友好报错中英文映射
+
+### 升级提示
+
+Docker 用户升级命令：`docker pull suoten/protoforge:1.4.1`（或 latest）。**使用 IEC 104 的用户建议立即升级**（v1.4.0 的 IEC104 服务端对标准主站不兼容）；**使用 S7（端口 102）的用户**：升级后需以 `--cap-add NET_BIND_SERVICE` 参数重建容器，或在协议高级配置中把 S7 端口改为 1024 以上（如 1102）。
+
+## v1.4.0 — 2026-09-30
+
+### 🚀 新功能 —— 体验与调试专项（用户反馈驱动）
+
+- **连接诊断向导**：协议服务卡片新增「诊断」按钮，一键体检"连不上"类问题——服务是否运行、监听地址是否本机网卡、端口是否可连通、是否已注册设备，逐项 ✅/❌ + 中文建议；弹窗内还支持**外连目标连通性测试**（填 EMQX/SIP 平台 IP:端口一键探测，含延迟）。新增 `/api/v1/diagnostics/*` API
+- **绑定地址预校验**：协议服务启动时校验 host 是否本机网卡地址——把 EMQX/SIP 平台 IP 误填为监听地址（高频错误）会在启动前被拦截，错误信息直接列出本机可用地址与正确做法
+- **软件内更新提示**：自动检查 GitHub 最新版本，仪表盘顶部横幅提示"发现新版本 + 当前版本"，可展开查看 Release Notes、一键复制升级命令、跳转发布页；设置→关于页同步展示。检查失败静默降级不影响使用，10 分钟缓存
+- **测点调试 Force**：设备测点弹窗新增 Force/释放——把测点钉在固定值（每 tick 强制覆盖生成器），调试告警阈值/边界场景利器；已强制测点显示黄色标签；引擎重启后自动失效。新增 force API
+- **值快照/恢复**：一键记录设备当前全部测点值，随时一键恢复（存本地浏览器），复现问题/对比数据的得力工具
+- **测点批量添加**：编辑设备弹窗新增「批量添加测点」——名称前缀 + 起始序号 + 地址（如 DT100）+ 数量，一键生成 N 个测点（地址自动递增），500 点级仿真不再需要逐个添加
+- **批量克隆**：设备"更多"菜单新增「批量克隆」——数量、名称模式（{name}-{n}）、从站号/站号递增、测点地址偏移量，多从站场景一键生成 N 台设备
+- **简单克隆**：设备"更多"菜单补上单台克隆入口（后端能力此前未暴露 UI）
+- **新手三步引导**：仪表盘无设备时显示分步引导卡片（选模板→启协议→连客户端），附模板市场/设备管理直达按钮
+- **示例场景一键生成**：场景编排页新增「一键示例场景」——自动创建演示温度设备（正弦生成器）+ "高温>80°C 报警"阈值联动规则，开箱即学的场景编排样例
+
+### ✨ 体验改进
+
+- **协议角色徽章**：协议服务卡片上的模式标签（Server/Broker/Slave/SIP…）悬停显示"谁连谁"的角色说明（如"服务端：被动等待你的主站来连接，你不需要填对方地址"），从根源上解释 MQTT/GB28181 的连接方向困惑
+- **MQTT 配置弹窗中文化**：host/auth 等字段描述改为完整中文引导（含 host 语义警告、auth_users JSON 格式）；弹窗顶部连接注意事项同步扩充
+- 前端 i18n 深度审计：修复生成器配置参数标签显示原始 key（common.stepSize 等 7 个）、True/False 选项、回路类型、场景动作类型、Run/Report/Rule ID 列标题等遗留英文；中英词表各扩充 60+ 条
+- 英文版 README 协议/模板计数与中文版同步（28/133），补充 MQTT 角色澄清
+
+### 🐛 Bug Fix（累计于 master，含 v1.3.4 之后）
+
+- IEC 104 报文 COT 多 1 字节导致主站侧地址 ×256、遥测乱码（QTester104 实测）
+- 编辑设备后第三方客户端"连线中断"（热更新未重建协议服务器内部状态）
+- VPN 虚拟网卡 FakeIP 导致回调地址探测错误（Issue #15）
+- 松下 MEWTOCOL 新协议（Issue #11）及 EdgeLite 联调修复批次
+
+---
+
+## v1.3.4 — 2026-09-30
+
+**New — 程序版本号全局可见（用户建议：界面各处显示版本号，便于排查问题时提供版本信息）：**
+
+- 后端：/health 接口新增 version 字段；修正 FastAPI app version 写死 0.1.0 与实际发布版本不一致的问题
+- 前端新增 version.js 全局版本缓存（登录页/侧边栏/设置页共用一次请求）
+- 登录页底部显示 ProtoForge vX.Y.Z；左侧菜单底部显示 vX.Y.Z；系统设置新增"关于"页（程序版本 + GitHub/Gitee 项目主页 + Star 引导）
+- 浏览器实测三处均正确显示 v1.3.0
+
+## v1.3.3 — 2026-09-27
+
+**Bug Fix — Windows quickstart.bat 运行时报 "'xxx' is not recognized as an internal or external command" 乱码错误（用户反馈）：**
+
+- 根因一：cmd.exe 已知 bug——`chcp 65001` 后继续解析同一批处理文件时，文件读取偏移按旧代码页计算，UTF-8 多字节字符被错误切分，中文/制表符 echo 行被拆成"命令"执行报错
+- 根因二：`set /pf` 为无效语法（应为 `set /p`），JWT_SECRET 变量读不到，首次生成的 .env 密钥为空
+- 根因三：括号块内 `%errorlevel%` 在解析期展开，取到旧值，导致分支判断错乱
+- 修复：切码页后重启脚本让 cmd 在 UTF-8 下完整重读（重启标记 `__utf8`）；chcp 之前所有行保持纯 ASCII；`set /p` 修正；全部改用 `if errorlevel 1` 动态判断
+- 验证：真实运行 quickstart.bat，输出无乱码、服务正常启动（HTTP 200）
+
+**New — Windows 开机自启（用户需求：软件关闭后开机自动运行且设备配置不丢失）：**
+
+- 新增 `scripts/install_autostart.bat`：一键安装自启，写入用户"启动"文件夹的 VBS（隐藏窗口运行 quickstart.bat），Win+R `shell:startup` 删除 VBS 即可卸载
+- 设备/场景/模板配置存于 `data/protoforge.db`（SQLite + WAL），与代码目录同在，重启/关机不丢失；data/ 目录已在 .gitignore 中
+
+## v1.3.2 — 2026-09-25
+
+**Bug Fix — 编辑设备弹窗测点表格"访问模式"显示 accessModes.rw、数据类型下拉选项截断（UIN.../FLO...，用户截图反馈）：**
+
+- 根因一：constants.js 中访问模式 label 是 i18n key（`accessModes.r/rw/w`），但 i18n.js 缺少 `accessModes` 翻译段，t() 找不到就原样返回 key 本身
+- 根因二：NSelect 菜单宽度默认跟随触发器宽度，列宽较窄时下拉选项被省略号截断
+- 修复：i18n 补充 `accessModes` 中英文段（只读/只写/读写）；Devices.vue 与 Templates.vue 测点表格下拉渲染统一加 `consistent-menu-width=false`（菜单宽度自适应内容）；设备编辑弹窗加宽至 1180px、scroll-x 同步 1160
+- 验证：真实服务 + 浏览器实测——访问模式显示"读写"、数据类型触发器完整显示 FLOAT32/INT16/布尔、下拉展开后全部选项（布尔/INT16/INT32/UINT16/UINT32/FLOAT32/FLOAT64/字符串）完整无截断
+
+## v1.3.1 — 2026-09-23
+
+**Improvement — Docker 部署连接不上协议端口的引导（用户反馈：S7 工具连 172.17.0.2:102 超时）：**
+
+- DEPLOYMENT.md：docker run 示例补充协议端口映射（`-p 102:102 -p 502:502 ...`），并说明容器内网 IP（172.17.x.x）不可直达、客户端应填宿主机 IP
+- 连接指南：检测到运行在 Docker 容器内（/.dockerenv 或 PROTOFORGE_IN_CONTAINER）时，弹窗顶部显示警告条，提示 host 为容器内网地址、需改用宿主机 IP + 映射端口（中英文）
+- 验证：8010 实例模拟容器环境，浏览器实测警告条在指南弹窗正确渲染；非容器环境不显示
+
+**Bug Fix — 仿真测试"可视化编辑"选中操作后，设备/协议/测点等参数框不显示（宽度为 0 隐形，无控制台报错）：**
+
+- 现象：上一版修复了操作下拉的渲染崩溃后，用户反馈"控制台不报错了，但选完操作还是看不到设备/协议参数框"
+- 根因：参数行使用 n-space 布局，n-space 默认（`wrap-item=true`）给**每个子元素单独包一层 wrapper div**，写在 n-select/n-input 上的 `style="flex:1"` 只能撑满自己的 wrapper，而 wrapper 宽度由内容决定——空的 select 内容宽度为 0，于是参数控件以 0 宽度渲染，肉眼完全不可见（DOM 实测 `rect.width = 0`）
+- 修复：参数行 n-space 加 `:wrap-item="false"`，子元素成为 n-space 的直接 flex 子项，`flex:1` 真正生效
+- 验证：真实服务 + 浏览器端到端复现（修复前：设备参数框 0 宽度隐形；修复后：选中"获取设备"后设备下拉可见、展开后真实设备列表齐全，无控制台错误）
+
+## v1.3.0 — 2026-09-16
+
+**Feature — 工业标杆级升级：新增 4 个协议 + 设备/场景克隆 + 北向平台预设 + DAG 规则链编排引擎**
+
+- **新增协议 DLT/T 645-2007**：多功能电能表通信协议，中国电力行业标准，BCD 编码 + 0x33 传输加密，支持有功/无功电能、电压/电流/功率数据读取，端口 37120
+- **新增协议 CJ/T 188-2004**：户用计量仪表数据传输协议，中国城建行业标准，支持水表/气表/热量表，BCD 编码、类型码寻址，端口 37121
+- **新增协议 Custom TCP/UDP**：自定义帧格式仿真，支持十六进制模板解析、变长帧、校验和计算、灵活数据映射，端口 38000/38001
+- **新增协议 S7Comm-Plus**：西门子 S7-1200/1500 新一代通信协议，基于 TPKT/COTP，支持优化块访问、SZL 读取、符号寻址，端口 10202
+- **设备克隆 API**：`POST /devices/{device_id}/clone`，一键复制设备配置（协议、测点、生成器、协议配置）
+- **场景克隆 API**：`POST /scenarios/{scenario_id}/clone`，一键复制场景（设备绑定、运行参数）
+- **北向平台预设**：ThingsBoard / 阿里云 IoT / EMQX 三大平台一键配置数据转发
+- **DAG 规则链编排引擎**：`source -> filter -> transform -> action` 链式执行，支持 JSON DSL 定义规则链
+- **设备模板扩充至 131 个**：新增 dlt645（单相/三相电表）、cjt188（水/气/热表）、custom_tcp/udp（传感器）、s7plus（S7-1500）模板
+- **i18n 修复**：补全 9 个协议（iec104/iec61850/coap/dds/dlt645/cjt188/custom_tcp/custom_udp/s7plus）的中英文描述与端口号，修复协议服务页面描述显示为 i18n key 及端口显示为 8000 的问题
+
+**Improvement — 客户端连接注意事项推广到全协议（由 MQTT 3.1.1 协议版本坑泛化）：**
+
+- 设备弹窗（快速创建 / 高级创建 / 编辑）的连接注意事项改为数据驱动（`web/src/protocolNotes.js`，双语），选中协议即展示对应条目，新增 15 个协议的已知连接坑：Modbus TCP（Unit ID）、Modbus RTU（串口三要素）、S7（rack/slot 与 PUT/GET）、OPC-UA（Security=None + Anonymous）、IEC 104（CA/IOA）、DL/T 645（表地址与 0x33）、CJ/T 188、FINS（UDP/TCP 端口）、MC（3E/4E 帧）、BACnet（UDP 47808 / BBMD）、FANUC（8192 端口）、OPC DA（DCOM 权限）、AB（CIP 槽号）、GB28181（SIP 注册三元组）、自定义 TCP/UDP（帧格式）
+- 文档新增「其他协议的数据外送」说明：除 MQTT（设备级自定义 broker）与 GB28181（设备主动注册平台）外，其余协议为服务端模型，数据外送统一走数据转发功能
+
+**Bug Fix — 仿真测试"可视化编辑"无法选择操作（下拉空白 + 控制台 `Cannot read properties of undefined (reading 'forEach')`）：**
+
+- 根因：测试步骤的"操作"下拉用 naive-ui n-select 构造分组选项时，把 `{type:'group'}` 分组与选项**平铺**在同一层且分组缺少必需的 `children` 数组，n-select 渲染分组时对 `undefined.forEach` 抛 TypeError，整个下拉组件渲染成空壳——表现为"操作下拉点不开/选不上、设备/测点参数框出不来"，执行测试必然失败
+- 修复：分组选项改为标准嵌套结构（`{type:'group', label, key, children:[...]}`），与导航菜单的写法一致
+- 验证：真实服务 + 浏览器端到端复现（修复前：下拉空壳 + 控制台 TypeError；修复后：下拉正常打开、8 个操作全部可见、选择"读取测点"后设备/测点参数框正常联动出现、无控制台错误）
+
+**Bug Fix — `.env` 编码被改坏导致服务启动崩溃 `UnicodeDecodeError: 'utf-8' codec can't decode`：**
+
+- 根因：`.env.example` 的注释含中文，安装时复制为 `.env`；清理工具或系统自带记事本一旦把 `.env` 重新编码为 GBK/ANSI，服务启动读 `.env`（固定按 UTF-8）即崩溃，且重新安装也无法自愈（安装器保留已存在的 `.env`）
+- 修复：`.env.example` 注释全部改为纯 ASCII（中文文档指向 README），从源头消除该故障类别；安装器新增 `_read_env_text()` 编码自愈——读 `.env` 遇到非 UTF-8 时按 GBK 解码并自动重写回 UTF-8（覆盖 `_ensure_env_key` 与端口/密码读取两处），重新运行 install.bat 即可修复被改坏的 `.env`
+- 用户临时修复：删除项目根目录的 `.env` 后重新运行 install.bat
+
+**Improvement — MQTT 外部 broker 发布在协议调试日志中可见（external_publish 事件）：**
+
+- 背景：用户对接 ThingsBoard 时连接成功（external_connect）但无法确认数据是否在上传——外部发布路径此前没有调试日志事件，只有连接/失败事件，观测存在盲区
+- 实现：每次向外部 broker 发布成功记录 `tx/external_publish` 事件，含主题、QoS、Retain、字节数与 payload 预览（超 200 字节截断并标注，避免日志膨胀）
+
+**Bug Fix — 安装器第 4 步"构建前端页面"崩溃：`FileNotFoundError: [WinError 2] 系统找不到指定的文件`：**
+
+- 根因：安装器用裸字符串 `"npm"` 调 `subprocess.run`，Windows 的 `CreateProcess` 只能直接解析 `.exe`，而 npm 是 `npm.cmd`；且 Windows 版 Node.js 发行包里同时带一个无扩展名的 Unix sh 脚本 `npm`，`shutil.which("npm")` 可能命中它导致 `WinError 193`（不是有效的 Win32 应用程序）。两种情况都会让源码安装在第 4 步直接抛异常中断
+- 修复：新增 `_find_npm()`——Windows 下显式优先解析 `npm.cmd` 完整路径（次选 `npm`，最后兜底 Unix 的 `npm`），`npm install` / `npm run build` 全部使用解析出的完整路径；npm 启动异常（`OSError`）不再中断安装，降级为"使用仓库中预构建的前端"并给出提示；前端构建失败时打印 stderr 末尾 3 行辅助定位
+- 验证：`npm --version` 经解析路径调用成功（rc=0）；安装器语法编译通过
+
+**Bug Fix — 编辑设备/模板"添加测点"后保存报"更新失败"（默认地址与既有点位重叠被 400 拦截）：**
+
+- 根因："添加测点"的默认地址取 `points.length`（如第 5 个点位默认地址 4），而默认类型 float32 占 2 个寄存器（4~5）。设备中只要存在相邻的多字节点位（如内置温湿度传感器模板的报警位@5、或连续排列的 float32），默认地址必然与既有点位地址范围重叠——v1.2.7 起后端会拦截重叠并返回 400"检测到同设备点位地址重叠"，界面表现为"更新失败"，用户无从得知是默认地址撞车
+- 修复：默认地址改为自动计算下一个不重叠的空闲寄存器地址——按数据类型寄存器占用数（bool/int16 占 1、float32/int32 占 2、float64 占 4、string 占 32，与后端一致）、区分线圈/保持寄存器存储区、兼容 C/HR/IR/DI 前缀与 6 位 PLC 记法（40001→地址 0）；默认点名同步避让重名。覆盖设备编辑弹窗与模板新建/编辑弹窗共 3 处入口
+- 说明：若设备**既有**点位本身已重叠（历史数据），保存仍会被拦截，错误信息中会列出冲突点位名与地址范围，按提示调整即可；新增点位的默认地址不会再引发冲突
+- 校验脚本 `web/scripts/validate-point-address.mjs`（22 例）：地址解析（纯数字/前缀/PLC 记法/非法输入）、空闲地址分配（模板场景/连续多字节/混合前缀/线圈区独立分配/空列表）、点名避让；`node scripts/validate-point-address.mjs` 可独立运行
+
+**Bug Fix — AB/EtherNet-IP pylogix Forward Open 永远失败（四处帧格式错误叠加）：**
+
+- Null Address Item：SendRRData 应答中 Null Address Item 写了 Length=4 并多跟 4 字节零（标准要求 Length=0 无数据），CIP 数据整体偏移 +4，客户端在 offset 42 读 GeneralStatus 读到错位字节
+- Priority/TimeoutTicks：Forward Open 请求解析只跳过 1 字节，实际 Priority(1) 与 TimeoutTicks(1) 是两个独立字节，后续所有字段（连接 ID/参数）错位 1 字节，echo 回客户端的值错误
+- Large Forward Open：pylogix>=1.1 在 ConnectionSize>511 时发送 0x5B Large Forward Open，原实现不识别直接返回错误帧；现按大格式解析（Params 为 4 字节，响应 Service=0xDB）
+- SendUnitData：item_count 原来读在 offset 16（EIP header 内部），导致 Read/Write Tag 全部走错误分支，已连接模式读写永远失败；现按标准布局解析（header(24)+InterfaceHandle(4)+Timeout(2)+ItemCount(2)+Address Item+Data Item）
+- 补充 CIP Get_Attributes_All (0x01)：pylogix 的 GetDeviceProperties()/连接 ping 依赖 Identity Object 查询，缺失时连接验证永远失败；现返回标准属性集（VendorID/DeviceType/ProductCode/Revision/Status/SerialNumber/ProductName，名称取自协议配置 device_name）
+- 读标签支持 `@cpu` / `@identity` 探针标签：EdgeLite/上位机常用该标签做连接健康检查，现返回设备名字符串（STRING 类型码 0xD0）
+- 回归测试 `tests/test_ab_forward_open.py`（11 例）：Null Address Item 结构（Length=0 无数据）、CIP 数据固定 offset 40、总长无额外填充、Forward Open echo 字段固定偏移、session/context 回显、0x5B 大格式响应 0xDB 与 4 字节 Params、SendRRData 路由 0x5B、Get_Attributes_All 属性集结构与默认名称、`@cpu` 探针返回设备名、端到端请求-应答 Item 解析往返
+
+**Bug Fix — 系统代理劫持集成层出站请求（502）+ EdgeLite Modbus 点位读取存储区错位：**
+
+- 系统代理：所有出站 `httpx.AsyncClient`（failover 对端健康检查、数据转发 InfluxDB/HTTP、webhook 推送、集成管理器/认证/HTTP 通道、EdgeLite 对接）补齐 `trust_env=False`——开启系统代理时回环/内网地址请求被代理劫持导致 502。回归测试 `tests/test_http_client_trust_env.py`（4 例）
+- EdgeLite 点位地址：地址翻译此前输出裸数字地址 + register_type，但 EdgeLite 的 modbus 驱动仅从地址前缀判定存储区（不读 register_type），input/coil/discrete 区会被错误当作 holding 读取。现输出带前缀地址（HR/IR/C/DI），register_type 作为冗余信息保留；FINS 地址按点位 data_type 附加驱动类型后缀（",r"/",i"/",dw" 等，原默认按 word 解析拿到原始字节）。测试 `tests/test_edgelite_point_translation.py` 更新至新语义并扩展至 42 例（含 FINS 后缀、OPC-UA 设备前缀）
+
+**Feature — FANUC 协议原始报文日志（raw_frames）：协议调试日志可查看底层 16 进制收发帧（协议研究场景）：**
+
+- 背景：用户学习研究 FANUC 协议底层 16 进制报文，协议调试日志此前只有应用层抽象事件（连接/请求/响应），看不到通信过程中的原始字节流
+- 实现：FANUC 协议新增 `raw_frames` 高级配置项（默认关闭，boolean；兼容 UI 文本输入 "true"/"1"/"on"/"yes"）。开启后每次 TCP 收发在协议调试日志中记录 `frame_rx` / `frame_tx` 事件，含完整 16 进制 dump、对端地址与字节长度；超过 256 字节的报文截断展示并标注总长，防止日志膨胀
+- 使用：协议服务页 → FANUC「高级配置」→ 添加 `raw_frames: true` → 点「启动」；默认关闭，不影响正常性能
+- 回归测试 `tests/test_fanuc_raw_frames.py`（5 例）：开启后 rx/tx 事件与 16 进制内容逐字节校验、默认关闭、字符串 "false"/"true" 兼容、256 字节截断保护；真实 TCP 连接端到端验证
+
+**Bug Fix — 布尔量点位读写异常：UI 显示 true/11 而协议寄存器为 0/1（用户实测）：**
+
+- 根因：写入链路不按 data_type 归一值。bool 点位写数字 11 → 原样入库，UI 显示 11、线圈却编码为 1；数值点位写字符串 "true" → int("true") 转换失败被静默吞掉，原始字符串入库，UI 显示 true、寄存器保持 0 —— 界面值与协议线上的值不一致，用户侧无从排查
+- 修复：新增共享归一函数 `normalize_point_value()`（`protoforge/models/device.py`），写入三处入口（API 层 `PUT /devices/{id}/points/{name}`、Modbus 协议层 `server.write_point`、DeviceInstance `write_point`）统一归一：bool 接受 "true"/"1"/"on"/"yes"（→True）、"false"/"0"/"off"/"no"（→False）、数字非零→True（与 Modbus 线圈语义一致）；数值类型字符串自动转换并钳制到类型范围；不可表示的值拒绝写入，API 返回 400 并给出点位名、数据类型与原因
+- 排查确认的另一要点：**bool 点位自动落在线圈区（0xxxxx）**，主站须用 FC01 读、FC05 写，FC03 读保持寄存器看不到布尔量点位；数值型点位才在保持寄存器区（4xxxxx）。已在 README 地址表与设备弹窗连接注意事项中标注
+- 回归测试 `tests/test_bool_value_normalization.py`（16 例）：归一函数单元测试（bool/数值/字符串/拒绝/钳制）+ API 层复现用户场景（写 "true"/11 到 bool 点位归一为 True、写 "true" 到 uint16 返回 400、写 "42" 正常转换）；诊断脚本 `scripts/diag_bool_write.py` 端到端验证线圈编码与寄存器值一致
+
+**Bug Fix — Windows 后台启动（start /B）后 `protoforge stop` 无法停止服务（Issue #12）：**
+
+- 根因一：PID 文件（`data/protoforge.pid`）仅在 Unix daemon 分支写入，Windows 上 `--daemon` 被禁用并引导用户用 `start /B` 启动——该路径永远不产生 PID 文件，`protoforge stop` 提示 "No background daemon found"
+- 根因二（潜伏 Bug）：旧 stop 流程用 `os.kill(pid, 0)` 探测进程存活，但 Windows 上 `os.kill` 对非 CTRL_* 信号一律走 `TerminateProcess`——**探测本身就会把目标进程杀掉**（退出码 0），等待-超时-SIGKILL 逻辑全部失效
+- 修复：所有启动方式（前台 / `start /B` 后台 / Unix daemon）统一写入 PID 文件，优雅退出时经 atexit 自动清理；`_process_alive()` 跨平台安全探测（Windows 用 `tasklist`，含重试防护，Unix 沿用 `os.kill(pid, 0)`）；Windows 停止改用 `taskkill /PID x /T /F`（杀进程树，含 uvicorn reload 子进程），超时/失败时兜底 `TerminateProcess`；无 PID 文件时按 `--port`（默认 8000）兜底查找监听中的 python 进程（`netstat -ano`），并校验进程镜像名防止 PID 复用误杀；Windows 下 `--daemon` 提示文案同步更新为可用的后台启动/停止流程
+- Windows 真实环境端到端验证：`start /B` 等效方式后台启动 demo 服务 → PID 文件与实际进程一致 → `protoforge stop` 成功停止且端口关闭、PID 文件清理；删除 PID 文件后重启服务 → 按端口兜底成功停止
+- 回归测试 `tests/test_cli_stop_windows.py`（9 例）：存活探测（含旧实现误杀回归）、PID 文件写入与清理、stop 杀死/残留清理/无目标提示、端口兜底查找
+
+**Bug Fix — 服务运行中修改协议端口（高级配置→启动）被静默忽略（用户反馈"自定义 TCP 端口号改不了"）：**
+
+- 根因：`engine.start_protocol` 对 RUNNING 状态一律静默跳过并返回成功。用户在协议服务"高级配置"弹窗把端口从 38000 改成其他值后点"启动"，界面提示启动成功，但服务仍监听旧端口——实际影响**所有协议**，不只 custom_tcp
+- 修复：单协议启动端点（`POST /protocols/{name}/start`）改为 `restart=True` 语义——协议已运行时先停止再按提交的配置启动（改端口后点启动即生效）；"一键启动全部"已预先过滤运行中的协议、设备创建的协议自动启动、demo 模式、集成管理器均保持原有幂等跳过语义，不受影响
+- 回归测试 `tests/test_protocol_restart_port.py`（3 例）：运行中带新端口重启 → 新端口监听旧端口释放、start-all 幂等性（不重启运行中协议）、设备自动启动路径语义不变；真实服务端到端验证（默认端口启动 → 改 38124 重启 → 38000 关闭 / 38124 监听 / 停止后端口释放）
+
+**Feature — 新协议：松下 MEWTOCOL（FP-X/FP7 系列 PLC，Issue #11 需求落地）：**
+
+- 新增 `mewtocol` 协议（第 28 种）：实现 MEWTOCOL-COM ASCII 命令集的寄存器读写范围——`%RD/%WD`（字区 DT/WR/LD/FL）与 `%RC/%WC`（触点区 X/Y/R/T/C/L），按需求方确认范围不含监视注册（%RM/%WM）与 PLC 状态监控（%MS/%MG）
+- 帧格式：`%STN#CMD<BCC>CR` 请求 / `$` 成功 / `!` 错误 响应，BCC 异或校验全量实现；32 位数据（int32/uint32/float32）占 2 个连续字、低字在前（松下 FP 约定）
+- 双传输栈：TCP（Mewtocol/TCP 风格，默认端口 2049）+ 串口（pyserial，波特率/数据位/校验/停止位可配）；串口不可用时自动降级 TCP bridge 模式（同 Modbus RTU 语义）
+- 站号路由：设备 `protocol_config.station_number`（0-255，默认 1）映射请求帧站号到设备，站号冲突在创建时拦截（校验前置，无半注册状态）；生成器动态值在读取时同步进内存区（规避 MC 服务器曾出现的"读到旧值"问题）
+- 外部写入（%WD/%WC）双向传播：内存区更新 + 引擎 DeviceInstance 同步 + 生成器冻结（写入值优先）
+- 内置设备模板：松下 FP-X（mewtocol_fpx）、松下 FP7（mewtocol_fp7）；前端协议清单/标签色/默认端口/连接注意事项同步更新
+- 回归测试 `tests/test_mewtocol.py`（11 例，严格 MEWTOCOL-COM 主站走真实 TCP）：%RD/%WD 字区读写回环（uint16/int16/float32 两字低字在前）、%RC/%WC 触点读写、BCC 错误响应、不支持命令错误帧、写入传播到引擎、动态值可见性、多站号路由、站号冲突、编解码单元测试；`tests/test_e2e_multi_protocol_real.py` + `tests/test_engine_device_coverage.py`（64 例）回归通过
+
+**Improvement — EdgeLite 联调修复批次（登录会话/区码兼容/读数链路/NodeId/路由）：**
+
+- EdgeLite 登录统一传 `no_revoke=True`（`edgelite.py` / `integration/auth.py` / `integration/manager.py` 共 5 处登录调用）：避免每次联调登录都撤销已有用户 session，反复登录导致对方被踢下线
+- FINS（`protocols/fins/server.py`）：兼容 EdgeLite 驱动对 W/H 区域的非标准区码（0xB4/0xB8 字区、0x34/0x38 位区），读写与字-位同步统一经 `_normalize_area` 归一化到标准区码（0xB1/0xB2）
+- MC/SLMP（`protocols/mc/server.py`）：覆写 `get_value`——正弦波/随机游走等动态生成器产生的新值同步写入 `_device_memory`（原实现只更新字典，EdgeLite 经 SLMP 读取 `_device_memory` 拿到旧值/初始值）；多设备共享 network/station/pc 路由参数时的设备路由优先 `_default_device_id`
+- OPC-UA（`protocols/opcua/server.py`）：用户显式指定 `ns=X;s=Y` 的点位地址不再追加设备前缀，EdgeLite 等外部客户端可直接按模板配置的 NodeId 访问；仅非 ns= 格式地址保留唯一化前缀防多设备冲突
+- IntegrationManager（`integration/manager.py`）：值采集新增 `get_point_values_snapshot` 快照通道，点位值兜底取 `fixed_value`，减少联调时"读到空值"
+- 联调测试（`tests/test_real_machine_joint.py`）：EdgeLite 子进程优先使用其自带虚拟环境解释器（`.venv-ci`/`.venv`），避免 ProtoForge venv 缺少 edgelite 运行依赖导致用例误报
+- 验证：`tests/test_fins_bits.py` + `tests/test_edgelite_point_translation.py` + `tests/test_net_detect.py` + `tests/test_integration.py`（86 例）与 `tests/test_e2e_multi_protocol_real.py`（10 例，真实 MC/FINS/OPC-UA 服务端到端）全部通过
+
+**Bug Fix — VPN 虚拟网卡导致回调地址探测到 FakeIP，网关无法回连（Issue #15）：**
+
+- 用户环境开启 VPN（Clash/Surge 等）后，服务把本机地址自动上报为虚拟网卡上的 FakeIP（198.18.x.x，RFC 2544 保留段）——传统探测方式"UDP connect 8.8.8.8 后读 `getsockname()`"依赖默认路由，而 VPN 把默认路由指向 utun 虚拟网卡，探测结果必然是虚拟地址
+- 影响：EdgeLite 等集成上报给网关的 ProtoForge 回调地址不可达（`get_protoforge_host()`）；OPC UA endpoint 广播地址同理
+- 修复：新增共享探测工具 `protoforge/core/netutils.py`——优先枚举与本机主机名关联的地址（通常只含真实物理网卡），过滤 FakeIP(198.18.0.0/15)、CGNAT(100.64.0.0/10)、链路本地(169.254/16)等虚拟/保留网段后按 192.168 > 10 > 172.16-31 优先级选择；UDP 探测降级为回退路径且结果同样过滤。`get_protoforge_host()` 与 OPC UA `_get_local_ip()` 统一接入
+- 手动兜底不变：`PROTOFORGE_PUBLIC_HOST` 环境变量仍可强制指定对外地址
+- 回归测试 `tests/test_net_detect.py`（14 例）：虚拟网段判定、FakeIP+真实网卡混合候选选择、网段优先级、仅虚拟候选时返回空、UDP 回退过滤、EdgeLite 回调地址跳过 FakeIP、PUBLIC_HOST 覆盖优先
+
+**Bug Fix — 编辑设备保存后第三方客户端显示连线中断（热更新绕过协议服务器重建）：**
+
+- 用户反馈：经常在"设备管理 → 编辑设备"保存后，第三方客户端显示连线中断
+- 根因：`engine.update_device` 的热更新路径只直接改写 `server._device_configs`，**绕过了协议服务器的 `remove_device`/`create_device` 标准重建流程**——各协议服务器的内部映射（Modbus 从站数据区/从站号映射、IEC104 的 IOA 点表、各协议 behavior 等）仍停留在旧配置。客户端按新配置（新点位地址/新从站号）轮询时读到旧点表（非法地址/无响应），客户端软件将其显示为"连线中断"
+- 修复：热更新两个分支（仅参数变更 / 点位增删）统一改走 `_resync_protocol_device`——先 `remove_device` 再 `create_device` 重建内部映射，然后把引擎当前值写回；重建失败自动回滚注册旧配置，设备不会从协议服务器丢失。`remove_device`/`create_device` 均为纯内存注册表操作，不触碰监听端口与既有 TCP 连接，客户端连接保持不断
+- 回归测试 `tests/test_device_update_hot_resync.py`（3 例，真实 Modbus TCP 服务端 + 真实 pymodbus 客户端走真实 TCP）：编辑设备（改从站号 1→5 + 新增点位）后同一 TCP 连接仍存活、新从站号新点位立即可读、`_slave_map` 等内部映射已按新配置重建；只改点位不动从站号场景；重建失败（从站冲突）自动回滚旧注册、设备不丢失
+
+**Bug Fix — IEC 104 遥信/遥测地址显示放大 256 倍、遥测值乱码（QTester104 实测反馈）：**
+
+- 根因：ASDU 固定头把**传送原因 COT 编码为 2 字节**（`struct.pack("<H", cot)`），而 IEC 60870-5-104 标准中 COT 为 **1 字节** + 源发地址 OA 1 字节 + 公共地址 CA 2 字节。多出的 1 字节使标准主站解析时**其后所有字段整体后移 1 字节**：CA=1 被读成 `0x0100`=256（×256）、IOA=n 被读成 n×256（1→256, 2→512…）、遥测浮点数与质量位错位成乱值（如 1922157431584980992.0）。用户排查方向（大小端/IOA 3 字节当 4 字节解析）均不是原因——驱动里 CA/IOA/float 本来就是标准小端
+- 修复：发送侧 `_asdu_header` 与接收侧 `_process_asdu`、`_handle_commands`（对象偏移 7→6）、`_asdu_length`（头长 7→6）、GI 的 QOI 偏移全部改为标准 1 字节 COT 布局；发送与接收两个方向同步修正
+- 顺带修正：IOA 第 3 字节按标准使用完整 8 位（原实现掩码 0x0F，IOA>4095 的点会错位）
+- 新增支持带 CP56Time2a 时标的遥控命令（QTester104 遥控默认类型）：C_SC_TA_1(58)、C_DC_TA_1(59)、C_SE_NB_TA_1(61)、C_SE_NC_TA_1(62)，S/E 选择执行位按 TI 正确定位，确认帧完整回显时标对象
+- 回归测试 `tests/test_iec104_wire.py`（7 例，内置严格按标准实现的迷你主站走真实 TCP）：M_ME_NC_1 帧布局逐字节校验（CA/IOA/浮点值/APDU 长度 0x12）、M_SP_NA_1 标准长度 0x0E、总召唤 ACT→CON(QOI)→逐点 COT=20→ACTTERM、C_SC_NA_1 直接遥控、C_SC_TA_1 时标遥控、选择-执行 SBO 流程、IOA 24 位全宽编解码
+
+**Bug Fix — CI Layer 3 exception lint 门禁失败（IntegrationManager `_ensure_connected` 静默吞异常）：**
+
+- CI（API Consistency Check / check-exception-patterns）扫描出 1 个 error 级违规：`protoforge/integrations/integration/manager.py` `_ensure_connected` 的 `except Exception` 后直接 `return False`，无日志无重抛，连接失败无从排查
+- 修复：except 块补 `logger.warning("HTTP ensure_connected failed: %s", e)` 后再返回 False（降级为 warning 级 swallow_return_logged，符合门禁要求）；全量 lint 0 errors，`tests/test_integration.py` + `tests/test_edgelite_point_translation.py` 65 例回归通过
+
+## v1.2.7 — 2026-09-16
+
+**Bug Fix — 同设备点位地址重叠导致固定值失效/乱值（FLOAT32 占 2 个寄存器互相覆盖）：**
+
+- 根因：Modbus 多字节类型（float32/int32/uint32 占 2 个寄存器，float64 占 4 个，string 占 32 个）按起始地址向后占用多个寄存器。用户模板中 humidity@2（占 2-3）与 point_4@3（占 3-4）在寄存器 3 上重叠——两个点位的生成器各自按自己的节拍写寄存器 3，后写的字节序把先写的覆盖掉，导致"固定值=10"的 point_4 持续显示乱值（-1.86e-27 之类）且不断变动。用户侧完全无从排查
+- 修复：新增共享校验 `find_overlapping_points()`（`_common.py`），按同一存储区（线圈/离散/输入/保持）内地址范围做区间相交检测；所有设备与模板写入入口统一拦截——创建设备、快速创建（含模板）、批量创建、克隆设备、更新设备、CSV 导入、创建模板、更新模板、导入模板、模板实例化共 10 处。命中重叠返回 400，错误信息含冲突点位名、存储区、地址范围与寄存器占用明细（如"点位 'humidity'(地址 2, 保持寄存器区(4区), 占2个寄存器) 与 'point_4'(地址 3, ...) 地址范围重叠 [2~3] 与 [3~4]"）
+- 校验仅对 modbus 系协议生效；不同存储区同地址（如线圈@0 与保持寄存器@0）不冲突
+- 前端：设备测点弹窗新增"地址"列，modbus 纯数字地址按后端 auto 规则展示 5 位规范地址（bool→线圈区 00001 起，其他→保持寄存器区 40001 起，如 `3 (40004)`），多字节点位占多个寄存器从界面上一眼可见；快速写入下拉同步展示点位地址
+- 回归测试 `tests/test_point_overlap_validation.py`（7 例）：重叠拒绝/非重叠放行/跨存储区允许/更新拦截/快速创建模板拦截/批量创建记入 error 列表/非 modbus 不校验；既有 API 测试中本身含重叠数据的用例已修正地址
+
+## v1.2.6 — 2026-09-16
+
+**Bug Fix — Modbus 只读点位（access='r'）可被外部客户端写成功：**
+
+- 根因：访问模式只在平台自身写入路径（UI 快速写入 / `PUT /devices/{id}/points/{name}` / `ModbusServer.write_point`）校验；外部 Modbus 客户端走原生帧处理器（FC05/06/0F/10/16/17）直接写 store，完全不校验 access——界面上标为"只读"的点位被外部写成功且经 `_notify_external_write` 反向传播回点位值，语义不一致
+- 修复：TCP 与 RTU 两套 server 的全部外部写路径统一增加只读校验。命中 access='r' 点位（按地址范围匹配，含多寄存器点位跨度）→ 返回异常码 0x01（ILLEGAL FUNCTION），store 不变、不触发双向传播，并记 warning 日志 + `_log_debug`（事件 `modbus_write_rejected`）；广播写命中只读点位时按广播语义丢弃（无响应）
+- 共享助手下沉 `_common.py`：`point_area()`（auto 按数据类型判定存储区，与写入规则一致）、`point_reg_count()`、`WRITE_FC_AREA_MAP`，TCP/RTU 同源校验避免两份逻辑漂移
+- 回归测试 `tests/test_modbus_readonly_write_guard.py`（18 例）：TCP/RTU × 六种写功能码只读拒绝/放行、范围跨度拦截、广播静默丢弃、access='w' 可写、拒绝后不触发传播、rw 写传播不受影响
+- 真实 socket 验证 `tests/test_e2e_modbus_real.py::test_real_modbus_write_to_readonly_point_rejected`：真实 pymodbus 客户端写只读点位收到异常码 0x01、寄存器值不变、相邻 rw 点位正常写
+
+## v1.2.5 — 2026-09-16
+
+**Feature — MQTT 仿真设备支持上报自定义 MQTT 服务器（设备仿真对齐真实设备行为）：**
+
+- 设备协议配置新增 `server_host` / `server_port`（可选 `username` / `password` / `client_id`）：填入后仿真设备将以 MQTT 客户端身份连接用户自己的 broker（EMQX / Mosquitto / 阿里云 IoT 等）并上报数据，不再局限于内置 broker
+- 发布按设备路由：配置了 `server_host` 的设备走外部 client 发布，未配置的继续走内置 broker；遗嘱消息同样路由
+- 外部连接不可达时不会拖垮仿真：5s 重连限频 + 每 60s 限频告警 + 协议错误计数，恢复后自动重连
+- UI：创建 / 快速创建 / 编辑设备弹窗新增 MQTT 连接注意事项醒目提示；连接引导同步更新
+
+**Note — 内置 MQTT Broker 仅支持 MQTT 3.1.1：**
+
+- amqtt 不支持 MQTT 5.0。MQTTX 等客户端连接时必须手动将 Protocol Version 设为 3.1.1，否则连接失败（用户实测 MQTTX 默认 5.0 连不上，排查半天发现切协议版本即可）。已在 README、连接引导、设备弹窗三处醒目标注
+
+## v1.2.4 — 2026-09-16
+
+**Bug Fix — MQTT 设备启动后外部订阅者（MQTTX 等）收不到数据：**
+
+- 根因：点位 `address` 为单段值（官方 MQTT 模板即如此，如 GPS 模板 `address="latitude"`）时，发布主题被错误地当作**完整 topic** 使用，实际发到 `latitude`、`speed` 等顶层主题，`topic_prefix` 与 `device_id` 层级全部丢失，订阅 `protoforge/gps/#` 的客户端永远收不到数据
+- 修复：新主题推导规则 —— address 含 `{device_id}` 占位符 → 替换后使用；address 含 `/`（多级路径）→ 视为显式完整 topic；address 为空或单段 → 走默认层级 `{topic_prefix}/{device_id}/{point.name}`
+- 顺带验证：amqtt 0.11.3 `internal_message_broadcast` 内部广播路径本身可达（最小复现脚本确认），排除此前怀疑的 amqtt API 断裂
+- 回归脚本 `scripts/diag_mqtt_publish.py`：完整复现用户场景（broker + GPS 设备 + 外部订阅者），修复后订阅 `protoforge/gps/#` 正常收到 `protoforge/gps/latitude` 等消息
+- 注意：`topic_prefix` 在该版本起真正生效，使用官方模板创建的 MQTT 设备主题将变为 `{topic_prefix}/{device_id}/{point_name}`（如 `tracker/gps/<设备ID>/latitude`）
+
+## v1.2.3 — 2026-09-15
+
+**Bug Fix — 实时日志页高频流量下浏览器崩溃（含全站 WebSocket 推送排查）：**
+
+- 后端 `/ws/logs` 改为批量下发：一次排干队列积压（最多 200 条/帧），循环内高频日志（多设备被持续轮询）从每秒上千个 WS 帧降为个位数大帧
+- 后端 `/ws/devices` 加变化检测：设备列表仅在内容变化时发送，空闲期零重复推送（原实现每 0.1s 全量重发）；协议状态事件批量排干（最多 20 个/帧，帧型 `protocol_status_batch`）
+- Dashboard 日志流适配批量帧并改为 200ms 批量刷入（原逐条 unshift 每 500 条触发全量重渲染；且只处理旧 `log` 帧型，批量改造后已失效）
+- 前端 Logs 页改为 200ms 定时批量刷入：一次 flush 只触发一次列表重渲染和一次滚动，不再逐条全量重渲染 2000 行导致主线程饱和、内存飙升
+- 前端列表改用稳定 key（自增 id），新增日志只追加/裁剪，避免全列表重渲染；搜索过滤改为预拼接搜索串
+- 前端重连前先关闭残留 WebSocket，修复多连接叠加导致消息重复、负载倍增
+- `LogBus.emit` 跨线程安全：工作线程中的协议服务通过 `call_soon_threadsafe` 投递
+- 设备点位写入 API 拒绝 inf/-inf/nan（400），修复 JSON 序列化抛 "Out of range float values" 导致的 500
+- 回归脚本 `scripts/diag_log_ws_stress.py`：真实 uvicorn + WebSocket 压测，覆盖跨线程投递、循环内突发（500 条仅 2 帧）、洪峰优雅降级、设备列表变化检测
+
+## v1.2.2 — 2026-09-15
+
+**Bug Fix — 按照说明文档手动部署后登录 401：**
+
+- `protoforge demo` 未设置 `PROTOFORGE_ADMIN_PASSWORD` 时，默认密码改为 `admin`（与说明文档承诺一致）；此前会生成随机密码，导致按说明文档使用 `admin`/`admin` 登录的用户收到 401
+- Demo 启动时自动设置 `PROTOFORGE_RESET_ADMIN_PASSWORD=1`，旧数据库（密码为历史随机值）也会同步为 demo 默认密码；显式设置 `PROTOFORGE_RESET_ADMIN_PASSWORD=0` 可关闭
+- 非 demo 模式（`protoforge run`）行为不变：未配置时仍生成随机密码并在启动横幅打印，生产环境安全默认不受影响
+- 同步修正文档：README.md / README_EN.md / DEPLOYMENT.md（Docker 段密码说明），明确 demo 与生产模式的密码规则
+
+## v1.2.1 — 2026-09-14
+
+**Documentation Enhancement:**
+
+- Added comprehensive Modbus register type mapping section (Coil/Discrete Input/Input Register/Holding Register with function codes)
+- Added data type & register usage table (bool/int16/int32/uint32/float32/float64/string/real with byte order)
+- Added step-by-step tutorial: creating devices from real address tables (Modbus address table → ProtoForge config → verification code)
+- Added Modbus RTU serial port configuration documentation (baudrate/databits/parity/stopbits)
+- Added multi-device coexistence documentation (multiple slave_ids on same port)
+- Added write behavior documentation (FC05/06/0F/10/16/17 response and read-back behavior)
+- Added data generator documentation (fixed/random/sine/increment/ramp with update_frequency parameter)
+- Added competitor comparison table (vs Modbus Slave/Poll, Kepware, Node-RED Mock, real PLC)
+- Added protocol compliance documentation (standards followed + exception code mapping per protocol)
+- Added ARM/Raspberry Pi deployment guide with resource consumption benchmarks
+- Added open source vs enterprise feature comparison table
+- Updated README_EN.md with all corresponding English documentation
+
+## v1.2.0 — 2026-09-13
+
+**IoT Industrial Device Testing Platform:**
+
+- Added Test Plan Management: versioned test plans with CRUD operations, clone, status filtering (draft/active/archived). Backend: `protoforge/testing/plan.py` (TestPlan/TestRun data models + TestPlanManager). Frontend: `TestPlans.vue` with create/edit/delete/clone/run/history UI.
+- Added Test Execution Engine: `protoforge/testing/runner.py` (PlanRunner class) orchestrates protocol/device startup, runs test suites, applies fault scenarios, generates JUnit XML / JSON / HTML reports.
+- Added Protocol Compliance Checking: `protoforge/testing/compliance.py` with 5 protocol-specific checkers (Modbus TCP, S7, OPC-UA, IEC 104, MQTT). Each checker has defined rules and violation reporting. Compliance score (percentage) generated per check.
+- Added REST API endpoints: `test_plan_routes.py` (CRUD + run + history + report download) and `compliance_routes.py` (protocols list + rules preview + check execution + reports history).
+- Added database tables: `test_plans`, `test_runs`, `compliance_reports` with full CRUD in `db/session.py`.
+- Added CLI command: `protoforge test run` for CI/CD integration.
+- Added frontend pages: `TestPlans.vue` (plan management with modal forms, run result display, report download buttons) and `Compliance.vue` (protocol selector, rules preview, check execution, score display, history tab).
+- Added i18n support for all new UI elements (Chinese + English).
+- Added Playwright E2E tests: 31 browser tests covering page rendering, CRUD, execution, reports, compliance checking, navigation, error handling, i18n — all passing.
+
+**E2E Test Results (31/31 passed):**
+
+- Test Plans page rendering: title, menu, breadcrumb, create button, empty state ✅
+- CRUD operations: create, edit, delete, clone, status filter ✅
+- Run & reports: execute plan, view result modal, download JUnit/HTML/JSON, run history ✅
+- Compliance page rendering: title, menu, tabs, protocol selector, run check button ✅
+- Compliance interactive: select protocol, view rules, run check, view score, history tab ✅
+- Error handling: empty name validation, disabled button without protocol, 404 responses ✅
+- Navigation: menu navigation, direct URL access ✅
+- i18n: Chinese default, English switch ✅
+
+## v1.1.1 — 2026-09-11
+
+**UI/UX fixes (deep testing):**
+
+- Fixed i18n `directionLabels` keys not translating in Debug Logs page — `logs.directionLabels.system` showed as raw key instead of "系统"/"System". Root cause: `directionLabels` object existed in i18n.js but was outside the `logs` namespace. Fix: moved `directionLabels` into `logs` object in both zh and en.
+- Fixed NDropdown menus not responding to click — language switcher, user menu, and device "更多" dropdown used default `hover` trigger which was unreliable. Fix: added `trigger="click"` to all NDropdown components in App.vue and Devices.vue for consistent click-to-open behavior.
+
+**Deep testing results (all passed):**
+
+- Dashboard: 7 devices, 4 running protocols, 122 templates, 22 protocol categories ✅
+- Device Management: batch start/stop, edit, data points, quick create, CSV import/export ✅
+- Protocol Services: 22 protocols with start/stop/configure/detail ✅
+- Template Marketplace: 122 templates with category filter and search ✅
+- Simulation Testing: single device test passed (100% pass rate, 0.02s), test case editor ✅
+- Debug Logs: real-time WebSocket logs, protocol/direction filter, search, export ✅
+- Recorder: start/stop recording, recording list with detail/replay/export/delete ✅
+- Integration: EdgeLite connection config, per-device push/start-collect/read-points/verify ✅
+- Data Forward: add target, start/stop forward ✅
+- Webhook: CRUD, test webhook ✅
+- Settings: EdgeLite URL, CORS config, save ✅
+- Audit Log: search, delete, clear ✅
+- Backup & Restore: export backup, restore from file ✅
+- Scenario Editor: drag-and-drop canvas, save layout, add device ✅
+- i18n: Chinese/English switch works correctly ✅
+- Fault Injection API: sensor_drift, sensor_stuck, comm_loss, etc. (9 types) ✅
+- CSV Export API: returns valid CSV with all device points ✅
+
+## v1.1.0 — 2026-09-11
+
+**New Protocols (17 → 21):**
+
+- Added IEC 60870-5-104: Power telecontrol protocol (SCADA). Pure Python TCP server with APDU/ASDU parsing, U/S/I-format frames, spontaneous data transmission, command control (single/double/set-point commands). 7 device templates (BMS, CT/PT, microgrid, protection relay, solar plant, substation RTU, transformer).
+- Added IEC 61850: Substation automation standard with MMS TCP mapping. BER-encoded PDU parsing, Initiate/Conclude/Read/Write/GetNameList services, Logical Device → Logical Node → Data Object model, CDC types (SPS, MV, SPC, DPC). 3 device templates (bay controller, protection IED, solar IED).
+- Added CoAP (RFC 7252): Constrained Application Protocol for low-power IoT. Pure Python UDP server with CON/NON messages, GET/POST/PUT/DELETE, Uri-Path option parsing, Observe (RFC 7641) push, /.well-known/core discovery. 4 device templates (air quality, env sensor, gateway, smart meter).
+- Added DDS (Data Distribution Service): OMG standard pub/sub middleware with simplified RTPS wire protocol over TCP/UDP. Topic-based data distribution, subscribe/publish actions, QoS policies. 3 device templates (power grid, robot fleet, wind turbine).
+- All 4 new protocols are pure Python — no third-party dependencies required, included in core package.
+
+**Template expansion (90+ → 122):**
+
+- Added 32 new device templates across 4 new protocols (17 templates) and 2 existing protocols (energy meter, PV inverter for Modbus).
+- Fixed 6 duplicate template IDs that caused silent template overwriting during loading.
+- Total: 122 templates across 21 protocol categories.
+
+**CSV batch import/export:**
+
+- Added `GET /api/v1/devices/export-csv` endpoint — export all devices as CSV with one click.
+- Added `POST /api/v1/devices/import-csv` endpoint — batch import devices from CSV content.
+- Frontend CSV import/export buttons in Devices page.
+- Fixed route conflict: `/devices/export-csv` was incorrectly matched as `/{device_id}` — moved export route before parameterized route.
+- Fixed `AttributeError: 'DeviceInfo' object has no attribute 'get'` — export logic now handles both Pydantic models and dicts.
+
+**Recording compression:**
+
+- Recorder `export_compressed` method now uses gzip compression for storage optimization.
+- Reduced disk space usage for recorded protocol traces.
+
+**i18n fixes:**
+
+- Fixed i18n key display issue where `devices.importCSV` and `devices.exportCSV` showed as raw keys instead of translated text.
+- Added missing i18n keys (`importCSV`, `exportCSV`, `create`, `created`, `csvEmpty`, `csvExported`, `csvExportFailed`, `csvImported`, `csvImportFailed`) in both zh and en.
+- Removed incorrectly placed i18n keys from `common` namespace.
+- Fixed Vue component `t()` function calls — removed incorrect fallback parameters.
+
+**Documentation:**
+
+- Updated README.md: protocol count 17 → 21, template count 90+ → 122, added new protocols in feature list, protocol table, port table, and architecture diagram.
+- Updated version numbers across `pyproject.toml`, `protoforge/__init__.py`, and `web/package.json`.
+- Updated keywords in `pyproject.toml` to include new protocols.
+- Updated protocol optional-dependencies documentation in `pyproject.toml`.
+
+**OPC-DA:**
+
+- Real protocol implementation improvements (server.py modified).
+
+## v1.0.0 — 2026-08-31
+
+**Architecture refactor (core split):**
+
+- Split the former `protoforge/core` catch-all namespace into four domain packages:
+  `protoforge/engine` (simulation engine, devices, registry, event bus),
+  `protoforge/simulation` (scenarios, fault injection, behavior models, time series),
+  `protoforge/integrations` (EdgeLite, forward, webhook), and
+  `protoforge/observability` (log bus, metrics, audit, error monitor). `protoforge/core` now only contains `auth` plus backward-compatible re-exports.
+- Updated all 376 internal imports (90 files) to the new layout; ruff per-file-ignores updated accordingly.
+
+**Protocol layer hardening:**
+
+- Fixed silent MQTT data loss with amqtt >= 0.11: `Broker.internal_publish()` was renamed to `internal_message_broadcast()` (without a retain parameter), and the old `hasattr(internal_publish)` guard silently skipped every publish — broker connections worked but subscribers never received data. Added a version-tolerant `_broker_publish()` shim (uses `internal_message_broadcast` + public `retain_message()` on amqtt >= 0.11, falls back to `internal_publish` on older versions) and made a missing broker API log an ERROR plus a protocol-error metric instead of failing silently. Verified end-to-end on amqtt 0.11.3 (real broker + real client subscribe, retain stored).
+- Fixed Modbus TCP server wrongly rejecting reads on stopped devices: removed the stale `"stop" → 0x04` exception mapping so stopped devices respond with last-known values (matches real PLC behaviour and the EdgeLite collection path); updated outdated adversarial unit tests accordingly.
+- Added concurrency contract documentation to `ProtocolServer` base class (event-loop discipline, lifecycle idempotency, connection-handler robustness, write propagation, error reporting).
+- Added `ProtocolErrorCategory` enum and `record_protocol_error()` hook; wired all 13 protocol servers' fallback exception handlers to emit `protoforge_protocol_errors_total{protocol, category}` metrics (NETWORK vs INTERNAL), exposed via `/metrics` in Prometheus format.
+
+**CI & contract gating:**
+
+- Removed `|| true` soft-fail from OpenAPI export/validation steps; added an OpenAPI drift gate that fails CI when `openapi.json` is not regenerated after API changes.
+- Fixed all remaining ruff findings (bare except, SIM105/SIM108, B027, E402/E722/F841/E712); `ruff check protoforge/ tests/ scripts/` now passes clean.
+
+**Housekeeping & storage:**
+
+- Version aligned to 1.0.0 across `pyproject.toml`, `protoforge.__version__`, and `web/package.json`.
+- Root directory cleaned: test outputs, coverage artifacts, screenshots, and OCR experiment files removed; `.gitignore` hardened against re-entry.
+- `scripts/` triaged: 68 one-off debug/verification scripts removed; 35 operational tools retained (protocol `diag_*`, acceptance tests, CI-referenced scripts).
+- Verified storage is already consolidated on a single SQLite database (`data/protoforge.db`) with Alembic migrations; archived 15 stale integration-test databases (43 files) from `data/` to `data/backups/stale-dbs/`.
+- Confirmed `k8s/secrets.yaml` / Helm secrets contain only `CHANGE_ME` placeholders (no real credentials in repo).
+
+## v0.1.7 — 2026-05-10
+
+**Protocol startup port conflict fix:**
+
+- Fixed protocol servers (OPC UA/S7/MC/HTTP) using `asyncio.create_task()` for background startup, where port binding failure still returned 200 OK. Now `start_protocol()` waits 0.3s to check server status, returning 503 if ERROR state detected immediately.
+- Added configuration logging during protocol startup for easier port configuration troubleshooting.
+
+**Protocol management UI fix:**
+
+- Fixed missing "Stop All" button on protocol management page. Added `stopAll` function and `stoppingAll` state for one-click stop of all running protocols.
+
+**i18n interpolation fix:**
+
+- Fixed `{n}` not being replaced with actual numbers in confirmation dialogs (e.g., "Will start {n} protocols" showing raw template instead of "Will start 3 protocols"), unified to `{count}` with correct parameter passing.
+
+**Health check fix:**
+
+- Fixed Dashboard health check showing "Database: Operation Failed" / "Engine: Operation Failed", changed to more accurate "Error" label.
+
+**Device recovery fix:**
+
+- Fixed `create_device()` throwing `ValueError` when device already exists during startup recovery, added `allow_update` parameter for recovery scenarios.
+
+## v0.2.0 — 2026-05-11
+
+**P0 Security Fixes:**
+
+- Replaced hardcoded default admin password "admin" with auto-generated random password when `PROTOFORGE_ADMIN_PASSWORD` is not set
+- Fixed `_notifyUser()` parameter order error in api.js persistence warning
+- Changed no-auth mode identity from admin to anonymous/viewer
+- Fixed device point reading to prioritize protocol server data over memory simulation
+- Fixed scenario rule actions not propagating to protocol server layer
+- Fixed test report restoration from DB losing step details
+
+**P1 Reliability Fixes:**
+
+- Added ProtocolStatusEvent + WebSocket push for real-time protocol status updates
+- Unified device creation behavior: all creation methods now auto-start devices
+- Fixed ScenarioEditor rule data bidirectional mapping (edge double-click editing)
+- Added device re-registration when protocol starts after device creation
+- Replaced `dict[str, Any]` with Pydantic models in auth_routes.py
+- Changed CORS default from `*` to `localhost:5173,localhost:3000`
+- Added logging for silent exception fallbacks in auth.py, failover.py, rate_limit.py
+- Added try/except for database connection failures with clear error messages
+- Replaced Chinese error message matching in frontend with error_type/error_code matching
+- Unified protocol port definitions: edgelite.py and constants.js now read from config
+- Removed Chinese error messages from rate_limit.py 429 response

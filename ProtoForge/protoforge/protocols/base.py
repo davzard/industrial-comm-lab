@@ -1,0 +1,340 @@
+"""Module: base."""
+
+import asyncio
+import logging
+import threading
+from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
+from enum import Enum
+from typing import Any
+
+from protoforge.models.device import DeviceConfig, PointValue
+from protoforge.observability.metrics import metrics
+
+logger = logging.getLogger(__name__)
+
+
+class ProtocolStatus(str, Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    ERROR = "error"
+
+
+class ProtocolErrorCategory(str, Enum):
+    """协议层错误分类（配合 ``record_protocol_error`` 使用）。"""
+
+    FRAME_PARSE = "frame_parse"    # 协议帧解析失败（长度/校验/格式）
+    DATA_TYPE = "data_type"        # 点位值类型转换失败
+    NETWORK = "network"            # 网络 IO 错误（连接重置/超时）
+    INTERNAL = "internal"          # 其他未预期内部异常
+
+
+class ProtocolServer(ABC):
+    """协议服务器基类 — 所有 17 种协议实现的统一契约。
+
+    并发契约（Concurrency Contract）：
+
+    1. 事件循环纪律：所有协议服务器默认运行在主 asyncio 事件循环上。
+       禁止在协程中执行阻塞操作（同步磁盘 IO、DNS 解析、sleep、
+       同步协议库调用等）。同步三方库（如 python-snap7、bacpypes）
+       必须通过 ``asyncio.to_thread()`` / ``loop.run_in_executor()``
+       桥接到线程池，否则会阻塞 API 与其他协议。
+
+    2. 生命周期：``start()``/``stop()`` 必须是幂等协程；
+       ``stop()`` 后必须释放全部端口、任务与客户端连接，
+       不得向调用方抛出未捕获异常（应记入状态 ERROR 并返回）。
+
+    3. 连接处理健壮性：``_handle_connection`` 的帧解析循环必须以
+       ``except Exception`` 兜底，单个协议帧解析失败只记录日志
+       （经 ``_log_debug``），不得终止 accept 循环或其他连接。
+
+    4. 写入传播：外部客户端写入经 ``set_write_callback`` 回调传播到
+       DeviceInstance；引擎侧动态值经 ``sync_point_value``（可选覆写）
+       同步到协议数据存储，绕过访问控制。
+
+    5. 错误上报：协议层异常应通过 ``record_protocol_error`` 上报分类
+       计数（见 ``protoforge.observability.metrics``），供监控与告警。
+    """
+
+    protocol_name: str
+    protocol_display_name: str
+    protocol_description: str = ""
+    protocol_version: str = "1.0.0"
+
+    @staticmethod
+    def _validate_port(port: int, name: str = "port") -> None:
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            raise ValueError(f"{name} must be between 1 and 65535 (got {port})")
+
+    def __init__(self):
+        self._status: ProtocolStatus = ProtocolStatus.STOPPED
+        self._debug_callback: Callable | None = None
+        self._default_device_id: str | None = None
+        self._default_device_lock = asyncio.Lock()  # FIXED: 添加锁保护_default_device_id的并发访问
+        self._default_device_sync_lock = threading.Lock()  # FIXED-P1: 同步方法用的锁（asyncio.Lock不能在同步上下文使用）
+        self._behaviors_lock = asyncio.Lock()  # FIXED: 添加锁保护_behaviors字典的并发访问
+        self._behaviors_sync_lock = threading.Lock()  # FIXED: 同步方法用的锁（asyncio.Lock不能在同步上下文使用）
+        # 写回调：当外部客户端通过协议写入时，通过此回调传播到 DeviceInstance
+        self._on_write: Callable[[str, str, Any], Awaitable[bool]] | None = None
+        # 网络仿真器：用于模拟网络通信错误
+        self._network_sim = None
+        # 设备状态提供者：用于查询设备当前状态
+        self._device_state_provider: Callable[[str], str] | None = None
+        # 连接计数器
+        self._active_connections: int = 0
+        self._max_connections: int = 0  # v1.11.0 连接数上限（0=不限）
+
+    def set_debug_callback(self, callback: Callable) -> None:
+        self._debug_callback = callback
+
+    def set_write_callback(self, callback: Callable[[str, str, Any], Awaitable[bool]]) -> None:
+        """设置写回调，用于将协议层写入传播到 DeviceInstance。
+
+        当外部客户端（如 Modbus master、OPC-UA client）通过协议写入数据时，
+        协议 server 通过此回调将写入操作传播到引擎的 DeviceInstance，
+        确保内部状态与协议数据一致。
+
+        :param callback: 异步回调函数 ``async def(device_id, point_name, value) -> bool``
+        """
+        self._on_write = callback
+
+    @property
+    def on_write(self) -> Callable[[str, str, Any], Awaitable[bool]] | None:
+        """返回当前设置的写回调函数（可为 None）。"""
+        return self._on_write
+
+    def _log_debug(self, direction: str, msg_type: str, summary: str,
+                   device_id: str = "", detail: dict | None = None):
+        if self._debug_callback:
+            self._debug_callback(direction, msg_type, summary, device_id, detail)
+
+    def record_protocol_error(self, category: ProtocolErrorCategory, detail: str = "") -> None:
+        """上报协议层分类错误计数（并发契约第 5 条）。
+
+        计数键：``protoforge_protocol_errors_total{protocol, category}``，
+        经 /metrics 以 Prometheus 格式暴露。永不抛出异常。
+        """
+        try:
+            metrics.inc_counter(
+                "protoforge_protocol_errors_total",
+                labels={
+                    "protocol": getattr(self, "protocol_name", "unknown"),
+                    "category": category.value if isinstance(category, ProtocolErrorCategory) else str(category),
+                },
+            )
+        except Exception:
+            logger.debug("Failed to record protocol error metric", exc_info=True)
+
+    # -- 网络仿真集成 -------------------------------------------------------
+
+    def set_network_sim(self, sim) -> None:
+        """设置网络仿真器。"""
+        self._network_sim = sim
+
+    def should_drop_frame(self) -> bool:
+        """检查当前帧是否应被丢弃（CRC错误或丢包）。"""
+        if self._network_sim is None:
+            return False
+        # 优先检查 CRC 错误，其次检查丢包
+        if hasattr(self._network_sim, 'should_inject_crc_error') and self._network_sim.should_inject_crc_error():
+            return True
+        return hasattr(self._network_sim, 'should_drop') and self._network_sim.should_drop()
+
+    def should_simulate_half_open(self) -> bool:
+        """检查是否应模拟半开连接。"""
+        if self._network_sim is None:
+            return False
+        if hasattr(self._network_sim, 'is_half_open'):
+            return self._network_sim.is_half_open()
+        return False
+
+    # -- 设备状态提供者 -----------------------------------------------------
+
+    def set_device_state_provider(self, provider: Callable[[str], str]) -> None:
+        """设置设备状态查询回调。
+
+        :param provider: 回调函数，接受 device_id，返回状态字符串
+                        ("run"/"stop"/"starting"/"stopping"/"error"/"maintenance"/"program")
+        """
+        self._device_state_provider = provider
+
+    def get_device_state_string(self, device_id: str) -> str:
+        """获取设备的当前状态字符串。
+
+        无状态提供者时默认返回 "run"（不阻止正常请求）。
+        """
+        if self._device_state_provider is None:
+            return "run"
+        try:
+            return self._device_state_provider(device_id)
+        except Exception as e:
+            logger.debug("get_device_state_string: ignored exception: %s", e)
+            return "run"
+
+    # -- 连接追踪 -----------------------------------------------------------
+
+    @property
+    def active_connections(self) -> int:
+        """返回当前活跃连接数。"""
+        return self._active_connections
+
+    def on_client_connect(self) -> None:
+        """客户端连接时的回调，递增连接计数。"""
+        self._active_connections += 1
+
+    def on_client_disconnect(self) -> None:
+        """客户端断开时的回调，递减连接计数。"""
+        self._active_connections = max(0, self._active_connections - 1)
+
+    # -- 连接数上限（v1.11.0 大规模仿真）----------------------------------
+    # 各 TCP 服务器在 start() 里调用 _apply_connection_limit(config) 启用
+    # （protocol_config 的 max_connections 字段，0 = 不限）；在连接处理入口
+    # 调用 _connection_gate(writer) 执行检查，超限立即关闭新连接。
+
+    def _apply_connection_limit(self, config: dict) -> None:
+        """从启动配置读取 max_connections（0=不限），供 _connection_gate 使用。"""
+        try:
+            v = int((config or {}).get("max_connections", 0) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        self._max_connections = max(0, v)
+
+    def _connection_gate(self, writer) -> bool:
+        """连接数上限门：未超限返回 True；超限记录并关闭连接返回 False。
+
+        默认 _max_connections 为 0（不限）——未启用的服务器零行为变化。
+        """
+        limit = getattr(self, "_max_connections", 0)
+        if limit and self._active_connections >= limit:
+            self.record_protocol_error(
+                ProtocolErrorCategory.NETWORK,
+                f"connection limit reached ({self._active_connections}/{limit})")
+            logger.warning(
+                "%s: connection limit reached (%d/%d), rejecting new connection",
+                getattr(self, "protocol_name", type(self).__name__),
+                self._active_connections, limit)
+            try:
+                writer.close()
+            except Exception as e:
+                logger.debug("connection gate close error: %s", e)
+            return False
+        return True
+
+    @property
+    def status(self) -> ProtocolStatus:
+        return self._status
+
+    @abstractmethod
+    async def start(self, config: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def stop(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def create_device(self, device_config: DeviceConfig) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def remove_device(self, device_id: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def read_points(self, device_id: str) -> list[PointValue]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def write_point(self, device_id: str, point_name: str, value: Any) -> bool:
+        raise NotImplementedError
+
+    async def sync_point_value(self, device_id: str, point_name: str, value: Any) -> None:  # noqa: B027 — 有意提供的可选覆写钩子，非强制实现
+        """内部同步：更新协议数据存储中的点位值，**绕过访问控制检查**。
+
+        引擎 tick 循环调用此方法将动态生成的值同步到协议服务器的数据存储，
+        确保非固定生成器（random/sine/random_walk 等）的值能被外部客户端读到。
+
+        与 ``write_point`` 的区别：
+        - 不检查 ``access`` 权限（内部同步，非外部写入）
+        - 不将值写入 ``_written_values``（避免冻结生成器）
+        - 直接更新协议特定的数据存储
+
+        子类应根据自身数据存储机制覆写此方法。
+        默认实现为空操作，适用于直接从 behavior.get_value() 读取的协议。
+        """
+        pass
+
+    def get_config_schema(self) -> dict[str, Any]:  # FIXED: 空实现→子类应覆写提供协议配置schema
+        return {
+            "type": "object",
+            "properties": {},
+        }
+
+    def get_running_port(self) -> int | str | None:
+        """Return the running port number (int) for TCP protocols,
+        or serial port path (str) for serial protocols like Modbus RTU."""
+        return getattr(self, "_port", None)
+
+    def get_running_host(self) -> str:
+        return getattr(self, "_host", "0.0.0.0")
+
+    def _update_default_device(self, device_id: str) -> None:
+        with self._default_device_sync_lock:  # FIXED-P1: 同步方法加锁保护_default_device_id
+            self._default_device_id = device_id
+
+    async def _update_default_device_async(self, device_id: str) -> None:
+        # FIXED: 异步版本的默认设备更新，使用锁保护
+        async with self._default_device_lock:
+            self._default_device_id = device_id
+
+    def _clear_default_device(self, device_id: str) -> None:
+        with self._default_device_sync_lock:  # FIXED-P1: 同步方法加锁保护_default_device_id
+            if self._default_device_id == device_id:
+                self._default_device_id = None
+
+    async def _clear_default_device_async(self, device_id: str) -> None:
+        # FIXED: 异步版本的默认设备清除，使用锁保护
+        async with self._default_device_lock:
+            if self._default_device_id == device_id:
+                self._default_device_id = None
+
+
+class DeviceBehavior(ABC):
+    @abstractmethod
+    def generate_value(self, point_config: dict[str, Any]) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def on_write(self, point_name: str, value: Any) -> bool:
+        raise NotImplementedError
+
+
+def externally_cancelled() -> bool:
+    """当前任务是否正被外部取消（asyncio.wait_for 超时 / 事件循环关闭）。
+
+    依赖 Python 3.11+ 的 Task.cancelling()；3.10 及更早版本恒返回 False
+    （这些版本没有取消计数，调用方退回旧行为）。
+    """
+    current = asyncio.current_task()
+    getter = getattr(current, "cancelling", None)
+    return bool(getter and getter() > 0)
+
+
+async def shutdown_server_task(task: asyncio.Task | None) -> None:
+    """等待服务任务结束（供各协议 stop() 统一使用）。
+
+    吞掉**任务自身的**取消（正常 stop 语义：cancel 后等待退出）；
+    但若当前任务本身也被外部取消（asyncio.wait_for 超时 / 事件循环关闭），
+    必须继续传播——否则 wait_for 的 TimeoutError 被 suppress 吞掉，
+    调用方在 Python 3.12.0 上会永久挂起（黄金用例全量回归实测触发）。
+
+    :param task: stop() 要等待的服务主任务；None 直接返回。
+    """
+    if task is None:
+        return
+    try:
+        await task
+    except asyncio.CancelledError:
+        if externally_cancelled():
+            raise  # 外部取消（wait_for/loop 关闭）——继续传播

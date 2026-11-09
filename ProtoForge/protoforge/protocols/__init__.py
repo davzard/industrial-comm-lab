@@ -1,0 +1,69 @@
+"""protocols package."""
+
+from protoforge.protocols.base import DeviceBehavior, ProtocolServer, ProtocolStatus
+
+_PROTOCOL_CLASSES: dict[str, str] = {
+    "modbus_tcp": "protoforge.protocols.modbus:ModbusTcpServer",
+    "modbus_rtu": "protoforge.protocols.modbus:ModbusRtuServer",
+    "opcua": "protoforge.protocols.opcua:OpcUaServer",
+    "opcua_client": "protoforge.protocols.opcua:OpcUaClientProtocol",
+    "s7": "protoforge.protocols.s7:S7Server",
+    "fins": "protoforge.protocols.fins:FinsServer",
+    "mc": "protoforge.protocols.mc:McServer",
+    "mqtt": "protoforge.protocols.mqtt:MqttBroker",
+    "http": "protoforge.protocols.http:HttpSimulatorServer",
+    "gb28181": "protoforge.protocols.gb28181:GB28181Server",
+    "bacnet": "protoforge.protocols.bacnet:BACnetServer",
+    "ab": "protoforge.protocols.ab:AbServer",
+    "fanuc": "protoforge.protocols.fanuc:FanucServer",
+    "opcda": "protoforge.protocols.opcda:OpcDaServer",
+    "toledo": "protoforge.protocols.toledo:ToledoServer",
+    "mtconnect": "protoforge.protocols.mtconnect:MtConnectServer",
+    "ethercat": "protoforge.protocols.ethercat:EtherCATServer",
+    "profinet": "protoforge.protocols.profinet:ProfinetServer",
+    "iec104": "protoforge.protocols.iec104:IEC104Server",
+    "iec61850": "protoforge.protocols.iec61850:IEC61850Server",
+    "coap": "protoforge.protocols.coap:CoAPServer",
+    "dds": "protoforge.protocols.dds:DDSServer",
+    "dlt645": "protoforge.protocols.dlt645:DLT645Server",
+    "cjt188": "protoforge.protocols.cjt188:CJT188Server",
+    "mewtocol": "protoforge.protocols.mewtocol:MewtocolServer",
+    "custom_tcp": "protoforge.protocols.custom_tcp:CustomTcpServer",
+    "custom_udp": "protoforge.protocols.custom_udp:CustomUdpServer",
+    "s7plus": "protoforge.protocols.s7plus:S7PlusServer",
+    # v1.9.0 主站模式：主动拨出连接真实从站（Master/Client 侧）
+    "modbus_master": "protoforge.protocols.master.modbus_master:ModbusMasterServer",
+    "s7_master": "protoforge.protocols.master.s7_master:S7MasterServer",
+    "iec104_master": "protoforge.protocols.master.iec104_master:IEC104MasterServer",
+}
+
+PROTOCOL_REGISTRY: dict[str, type[ProtocolServer]] = {}
+PROTOCOL_LOAD_ERRORS: dict[str, str] = {}  # FIXED: 记录加载失败的协议及原因，供API查询
+
+
+def _load_protocols() -> None:
+    import importlib
+    import logging
+    logger = logging.getLogger(__name__)
+    for name, qual in _PROTOCOL_CLASSES.items():
+        if name in PROTOCOL_REGISTRY:
+            continue
+        module_path, _, class_name = qual.partition(":")
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            PROTOCOL_REGISTRY[name] = cls
+        except Exception as e:
+            PROTOCOL_LOAD_ERRORS[name] = str(e)  # FIXED: 记录加载失败原因
+            logger.warning("Failed to load protocol %s (%s): %s", name, qual, e)
+
+
+_load_protocols()
+
+__all__ = [
+    "ProtocolServer",
+    "ProtocolStatus",
+    "DeviceBehavior",
+    "PROTOCOL_REGISTRY",
+    "PROTOCOL_LOAD_ERRORS",
+]

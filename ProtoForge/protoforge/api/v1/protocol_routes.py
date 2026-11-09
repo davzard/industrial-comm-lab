@@ -1,0 +1,232 @@
+"""Protocol server management API routes (start/stop/config)."""
+
+import asyncio
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from protoforge.api.v1._helpers import _get_engine, _get_log_bus
+from protoforge.api.v1.auth import require_operator, require_viewer
+from protoforge.engine.defaults import get_friendly_error
+from protoforge.observability.messages import get_lang_from_request
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+@router.get("/protocols")
+async def list_protocols(request: Request, _user: dict[str, Any] = Depends(require_viewer)):
+    engine = _get_engine()
+    lang = get_lang_from_request(request)
+    protocols = engine.get_protocols()
+    from protoforge.engine.defaults import PROTOCOL_DEFAULTS, get_protocol_defaults
+    from protoforge.observability.messages import desc
+    result = []
+    for p in protocols:
+        entry = dict(p)
+        name = entry.get("name", "")
+        defaults = get_protocol_defaults(name, lang=lang)
+        entry["description"] = desc(f"protocol.{name}.desc", lang, PROTOCOL_DEFAULTS.get(name, {}).get("description", ""))
+        entry["display_name"] = desc(f"protocol.{name}", lang, PROTOCOL_DEFAULTS.get(name, {}).get("display_name", name))
+        entry["default_port"] = defaults.get("port", 0)
+        result.append(entry)
+    return {"protocols": result}
+
+
+@router.get("/protocols/info")
+async def get_protocols_info(request: Request, _user: dict[str, Any] = Depends(require_viewer)):
+    from protoforge.engine.defaults import get_all_protocol_info
+    lang = get_lang_from_request(request)
+    return {"protocols": get_all_protocol_info(lang=lang)}
+
+
+@router.get("/protocols/{protocol_name}/config")
+async def get_protocol_config(protocol_name: str, _user: dict[str, Any] = Depends(require_viewer)):
+    engine = _get_engine()
+    for p in engine.get_protocols():
+        if p.get("name") == protocol_name:
+            return p.get("config_schema", {})
+
+    raise HTTPException(status_code=404, detail=f"Protocol not found: {protocol_name}")
+
+
+@router.get("/protocols/{protocol_name}/device-config")
+async def get_protocol_device_config(protocol_name: str, _user: dict[str, Any] = Depends(require_viewer)):
+    from protoforge.engine.defaults import PROTOCOL_DEVICE_CONFIG
+    from protoforge.integrations.edgelite import EDGELITE_PUSH_FIELDS
+    config = list(PROTOCOL_DEVICE_CONFIG.get(protocol_name, []))
+    if protocol_name != "gb28181":
+        config.extend(EDGELITE_PUSH_FIELDS)
+    return {"protocol": protocol_name, "fields": config}
+
+
+@router.post("/protocols/start-all")
+async def start_all_protocols(request: Request, _user: dict[str, Any] = Depends(require_operator)):
+    engine = _get_engine()
+    log_bus = _get_log_bus()
+    lang = get_lang_from_request(request)
+    from protoforge.engine.defaults import get_friendly_error, get_protocol_defaults
+    results = {"started": [], "failed": [], "skipped": [], "port_warnings": []}
+
+    # 筛选需要启动的协议（已运行的跳过）
+    to_start: list[tuple[str, dict[str, Any], Any]] = []
+    for p in engine.get_protocols():
+        name = p.get("name", "")
+        if p.get("status") == "running":
+            results["skipped"].append(name)
+            continue
+        config = get_protocol_defaults(name, lang=lang)
+        original_port = config.get("port")
+        to_start.append((name, config, original_port))
+
+    if not to_start:
+        return results
+
+    async def _start_one(name: str, config: dict[str, Any], original_port: Any) -> dict[str, Any]:
+        """启动单个协议，返回结果字典。"""
+        try:
+            await engine.start_protocol(name, config)
+            actual_port = config.get("port", original_port)
+            port_changed = config.pop("_port_changed", False)
+            config_original_port = config.pop("_original_port", None)
+            if not port_changed and original_port and actual_port != original_port:
+                port_changed = True
+                config_original_port = original_port
+            log_bus.emit(name, "system", "", "protocol_start", f"Protocol {name} started on port {actual_port}", config)
+            entry: dict[str, Any] = {"ok": True, "name": name}
+            if port_changed:
+                entry["port_warning"] = {
+                    "protocol": name,
+                    "original_port": config_original_port or original_port,
+                    "actual_port": actual_port,
+                    "message": f"Port {config_original_port or original_port} is in use, automatically switched to {actual_port}",
+                }
+            return entry
+        except Exception as e:
+            friendly = get_friendly_error(str(e), lang=lang)
+            logger.warning("Failed to start protocol %s in start-all: %s", name, e)
+            return {"ok": False, "name": name, "error": friendly}
+
+    # 并行启动所有协议（每个协议的 server.start 互相独立，config 也是各自独立的 dict）
+    batch_results = await asyncio.gather(
+        *[_start_one(name, config, original_port) for name, config, original_port in to_start]
+    )
+
+    for r in batch_results:
+        if r.get("ok"):
+            results["started"].append(r["name"])
+            if "port_warning" in r:
+                results["port_warnings"].append(r["port_warning"])
+        else:
+            results["failed"].append({"protocol": r["name"], "error": r.get("error", "Unknown error")})
+
+    return results
+
+
+@router.post("/protocols/stop-all")
+async def stop_all_protocols(_user: dict[str, Any] = Depends(require_operator)):
+    engine = _get_engine()
+    log_bus = _get_log_bus()
+    results = {"stopped": [], "failed": [], "skipped": []}
+
+    # 筛选需要停止的协议（已停止的跳过）
+    to_stop: list[str] = []
+    for p in engine.get_protocols():
+        name = p.get("name", "")
+        if p.get("status") != "running":
+            results["skipped"].append(name)
+            continue
+        to_stop.append(name)
+
+    if not to_stop:
+        return results
+
+    async def _stop_one(name: str) -> dict[str, Any]:
+        """停止单个协议，返回结果字典。"""
+        try:
+            await engine.stop_protocol(name)
+            log_bus.emit(name, "system", "", "protocol_stop", f"Protocol {name} stopped")
+            return {"ok": True, "name": name}
+        except Exception as e:
+            logger.warning("Failed to stop protocol %s in stop-all: %s", name, e)
+            return {"ok": False, "name": name, "error": str(e)}
+
+    # 并行停止所有协议
+    batch_results = await asyncio.gather(*[_stop_one(name) for name in to_stop])
+
+    for r in batch_results:
+        if r.get("ok"):
+            results["stopped"].append(r["name"])
+        else:
+            results["failed"].append({"protocol": r["name"], "error": r.get("error", "Unknown error")})
+
+    return results
+
+
+@router.post("/protocols/{protocol_name}/start")
+async def start_protocol(protocol_name: str, request: Request, config: dict[str, Any] | None = None, _user: dict[str, Any] = Depends(require_operator)):
+    engine = _get_engine()
+    log_bus = _get_log_bus()
+    lang = get_lang_from_request(request)
+    from protoforge.engine.defaults import get_friendly_error, get_protocol_defaults
+    if config is None:
+        config = get_protocol_defaults(protocol_name, lang=lang)
+    original_port = config.get("port")
+
+    try:
+        # FIXED(Issue: custom_tcp 端口改不了): 单协议启动带 restart=True —— 协议已运行时
+        # 按提交的配置重启（否则用户在"高级配置"改端口后点启动会被静默忽略）。
+        # start-all 端点已预先过滤运行中的协议，不受影响
+        await engine.start_protocol(protocol_name, config, restart=True)
+        actual_port = config.get("port", original_port)
+        port_changed = config.pop("_port_changed", False)
+        config_original_port = config.pop("_original_port", None)
+        if not port_changed and original_port and actual_port != original_port:
+            port_changed = True
+            config_original_port = original_port
+        log_bus.emit(protocol_name, "system", "", "protocol_start", f"Protocol {protocol_name} started on port {actual_port}", config)
+        result = {"status": "ok"}
+
+        if port_changed:
+            result["port_changed"] = True
+            result["original_port"] = config_original_port or original_port
+            result["actual_port"] = actual_port
+            result["message"] = f"Port {config_original_port or original_port} is in use, automatically switched to {actual_port}"
+
+        return result
+
+    except HTTPException:
+        raise  # FIXED: 防止 HTTPException 被 except Exception 吞掉重新包装为 500
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except RuntimeError as e:
+        error_detail = str(e)
+        friendly = get_friendly_error(error_detail, lang=lang)
+        raise HTTPException(status_code=503, detail=friendly) from e
+    except Exception as e:
+        logger.exception("Failed to start protocol %s: %s", protocol_name, e)
+        raise HTTPException(status_code=500, detail=get_friendly_error(str(e), lang=lang)) from e
+
+
+@router.post("/protocols/{protocol_name}/stop")
+async def stop_protocol(protocol_name: str, request: Request, _user: dict[str, Any] = Depends(require_operator)):
+    engine = _get_engine()
+    log_bus = _get_log_bus()
+    lang = get_lang_from_request(request) if request else "zh"
+
+    try:
+        await engine.stop_protocol(protocol_name)
+        log_bus.emit(protocol_name, "system", "", "protocol_stop", f"Protocol {protocol_name} stopped")
+        return {"status": "ok"}
+    except HTTPException:
+        raise  # FIXED: 防止 HTTPException 被 except Exception 吞掉重新包装为 500
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except RuntimeError as e:
+        error_detail = str(e)
+        friendly = get_friendly_error(error_detail, lang=lang)
+        raise HTTPException(status_code=503, detail=friendly) from e
+    except Exception as e:
+        logger.exception("Failed to stop protocol %s: %s", protocol_name, e)
+        raise HTTPException(status_code=500, detail=get_friendly_error(str(e), lang=lang)) from e

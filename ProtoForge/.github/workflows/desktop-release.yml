@@ -1,0 +1,99 @@
+name: Desktop Portable Build
+
+# v1.6.0: 推送 v* tag（或手动触发）时在云端构建 Windows 便携包，
+# 自动挂载到 GitHub Release——免去网页手动上传。
+# 产物即 scripts/build_desktop.py 的 dist/ProtoForge-v*-win64-portable.zip。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-portable:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # FIXED: runner stdout 默认 cp1252，中文 print 会 UnicodeEncodeError
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -e ".[all]"
+          pip install pyinstaller pystray pillow
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm install
+          npm run build
+
+      - name: Build portable package
+        shell: bash
+        run: |
+          python scripts/build_desktop.py 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Expose error tail as annotation (anonymous-visible)
+        if: failure()
+        shell: bash
+        run: |
+          tail -60 build.log | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 14
+
+      - name: Extract changelog section for release body
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          # 从 CHANGELOG.md 截取 "## vX.Y.Z ..."（标题可带日期后缀）到下一个 "## " 之间的段落
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            BEGIN { h = "## v" ver }
+            index($0, h) == 1 && ($0 == h || substr($0, length(h) + 1, 1) == " ") { flag = 1; next }
+            flag && /^## / { exit }
+            flag { print }
+          ' CHANGELOG.md > release_body.md
+          # 截取失败/为空时回退，避免空正文
+          if [ ! -s release_body.md ]; then
+            echo "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/master/CHANGELOG.md) for details." > release_body.md
+          fi
+          cat release_body.md
+
+      - name: Attach zip to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ProtoForge-*.zip
+          body_path: release_body.md
+          generate_release_notes: true
+
+      - name: Upload workflow artifact (manual runs)
+        if: '!startsWith(github.ref, ''refs/tags/'')'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProtoForge-portable
+          path: dist/ProtoForge-*.zip
+          retention-days: 14

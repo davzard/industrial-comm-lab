@@ -1,0 +1,159 @@
+import pytest
+from httpx import AsyncClient
+
+
+@pytest.mark.asyncio
+async def test_root(client: AsyncClient):
+    response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+
+
+@pytest.mark.asyncio
+async def test_health(client: AsyncClient):
+    response = await client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_list_protocols(client: AsyncClient):
+    response = await client.get("/api/v1/protocols")
+    assert response.status_code == 200
+    data = response.json()
+    # FIXED: API返回 {"protocols": [...]} 结构，data是dict，需取data["protocols"]的长度
+    assert len(data.get("protocols", [])) >= 2
+    names = [p["name"] for p in data.get("protocols", [])]
+    assert "modbus_tcp" in names
+    assert "http" in names
+
+
+@pytest.mark.asyncio
+async def test_list_templates(client: AsyncClient):
+    response = await client.get("/api/v1/templates")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data.get("templates", [])) >= 1
+
+
+@pytest.mark.asyncio
+async def test_create_and_get_device(client: AsyncClient):
+    device_config = {
+        "id": "test-device-001",
+        "name": "test-sensor",
+        "protocol": "modbus_tcp",
+        "points": [
+            {
+                "name": "temperature",
+                "address": "0",
+                "data_type": "float32",
+                "unit": "C",
+                "generator_type": "random",
+                "min_value": 15.0,
+                "max_value": 35.0,
+            }
+        ],
+    }
+    response = await client.post("/api/v1/devices", json=device_config)
+    assert response.status_code == 200
+
+    response = await client.get("/api/v1/devices/test-device-001")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "test-device-001"
+    assert data["name"] == "test-sensor"
+
+    write_response = await client.put(
+        "/api/v1/devices/test-device-001/points/temperature",
+        json={"value": 23.5},
+    )
+    assert write_response.status_code == 200
+
+    # 设备详情必须读取协议实时值，不能返回 DeviceInstance 的旧缓存。
+    response = await client.get("/api/v1/devices/test-device-001")
+    assert response.status_code == 200
+    assert response.json()["points"][0]["value"] == 23.5
+
+    response = await client.get("/api/v1/devices/test-device-001/points")
+    assert response.status_code == 200
+    assert len(response.json()) >= 1
+
+    response = await client.delete("/api/v1/devices/test-device-001")
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scenario_crud(client: AsyncClient):
+    scenario_config = {
+        "id": "test-scenario-001",
+        "name": "test-scenario",
+        "description": "test",
+        "devices": [],
+        "rules": [],
+    }
+    response = await client.post("/api/v1/scenarios", json=scenario_config)
+    assert response.status_code == 200
+
+    response = await client.get("/api/v1/scenarios/test-scenario-001")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "test-scenario-001"
+
+
+@pytest.mark.asyncio
+async def test_scenario_export(client: AsyncClient):
+    scenario_config = {
+        "id": "test-export-001",
+        "name": "export-test",
+        "description": "test export",
+        "devices": [],
+        "rules": [],
+    }
+    await client.post("/api/v1/scenarios", json=scenario_config)
+    response = await client.get("/api/v1/scenarios/test-export-001/export")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "test-export-001"
+    assert data["name"] == "export-test"
+
+
+@pytest.mark.asyncio
+async def test_logs_endpoint(client: AsyncClient):
+    response = await client.get("/api/v1/logs")
+    assert response.status_code == 200
+    # FIXED: API returns {"entries": [...]} not {"logs": [...]}
+    data = response.json()
+    assert isinstance(data, dict) and "entries" in data
+
+
+@pytest.mark.asyncio
+async def test_http_protocol_device(client: AsyncClient):
+    device_config = {
+        "id": "http-device-001",
+        "name": "http-test",
+        "protocol": "http",
+        "points": [
+            {
+                "name": "status",
+                "address": "/status",
+                "data_type": "string",
+                "generator_type": "fixed",
+                "fixed_value": "running",
+            }
+        ],
+    }
+    response = await client.post("/api/v1/devices", json=device_config)
+    assert response.status_code == 200
+
+    response = await client.get("/api/v1/devices/http-device-001/points")
+    assert response.status_code == 200
+    # FIXED: API returns {"points": [...]} not a direct list
+    points_data = response.json()
+    if isinstance(points_data, dict):
+        points = points_data.get("points", [])
+    else:
+        points = points_data
+    assert len(points) == 1
+    assert points[0]["value"] == "running"
+
+    await client.delete("/api/v1/devices/http-device-001")

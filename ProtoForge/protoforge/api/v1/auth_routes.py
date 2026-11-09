@@ -1,0 +1,269 @@
+"""Authentication and authorization API routes (login, refresh, users)."""
+
+import logging
+import time
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field, field_validator
+
+from protoforge.api.v1.auth import require_admin, require_guest
+from protoforge.observability.messages import desc
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, description="Username")
+    password: str = Field(..., min_length=1, description="Password")
+
+    @field_validator("username", "password", mode="after")
+    @classmethod
+    def strip_whitespace(cls, v: str) -> str:
+        return v.strip()
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1, description="Refresh token")
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=1, description="Username")
+    password: str = Field(..., min_length=1, description="Password")
+
+    @field_validator("username", "password", mode="after")
+    @classmethod
+    def strip_whitespace(cls, v: str) -> str:
+        return v.strip()
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(..., min_length=1, description="Current password")
+    new_password: str = Field(..., min_length=1, description="New password")
+
+    @field_validator("old_password", "new_password", mode="after")
+    @classmethod
+    def strip_whitespace(cls, v: str) -> str:
+        return v.strip()
+
+
+class AdminResetPasswordRequest(BaseModel):
+    username: str = Field(..., min_length=1, description="Username")
+    new_password: str = Field(..., min_length=1, description="New password")
+
+
+class UpdateRoleRequest(BaseModel):
+    role: str = Field(..., min_length=1, description="New role")
+
+
+@router.post("/auth/login")
+async def login(credentials: LoginRequest):
+    try:
+        from protoforge.core.auth import create_refresh_token, create_token, user_manager
+        user, error_code = await user_manager.authenticate(credentials.username, credentials.password)
+
+        if not user:
+            if isinstance(error_code, str) and error_code.startswith("account_locked:"):
+                remaining = error_code.split(":")[1] if ":" in error_code else ""
+                raise HTTPException(status_code=423, detail=f"Account locked, retry after {remaining}s")
+            # FIXED(Issue#6): 高频登录失败多因"未设 PROTOFORGE_ADMIN_PASSWORD
+            # 时密码为自动生成值（data/.admin_password）"。提示给出可操作的
+            # 恢复路径，而不是只报错让用户反复试 admin/admin。
+            raise HTTPException(
+                status_code=401,
+                detail="用户名或密码错误。若忘记密码：①设环境变量 "
+                       "PROTOFORGE_ADMIN_PASSWORD=新密码 后重启服务即生效；"
+                       "②未设该变量时，自动生成的密码存放在 data/.admin_password "
+                       "文件中（桌面版在程序旁 data 目录）。",)
+        access_token = create_token(
+            user.id, user.username, user.role,
+            token_version=user_manager.get_token_version(user.id),
+        )
+        refresh_token = create_refresh_token(user.id)
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "username": user.username,
+            "role": user.role,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Login failed: %s", e)
+        raise HTTPException(status_code=500, detail="Login service temporarily unavailable. Please check server status and try again.") from e
+
+
+@router.post("/auth/refresh")
+async def refresh_token(data: RefreshRequest):
+    try:
+        from protoforge.core.auth import create_refresh_token, create_token, user_manager, verify_refresh_token
+        user_id = verify_refresh_token(data.refresh_token)
+
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+        user = user_manager.get_user_by_id(user_id)
+
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+
+        access_token = create_token(
+            user.id, user.username, user.role,
+            token_version=user_manager.get_token_version(user.id),
+        )
+        new_refresh_token = create_refresh_token(user.id)
+        return {
+            "access_token": access_token,
+            "refresh_token": new_refresh_token,
+            "token_type": "bearer",
+            "username": user.username,
+            "role": user.role,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Token refresh failed: %s", e)
+        raise HTTPException(status_code=500, detail="Token refresh failed") from e
+
+
+@router.post("/auth/register")
+async def register(user_data: RegisterRequest):
+    from protoforge.core.auth import user_manager
+
+    try:
+        user = await user_manager.create_user(user_data.username, user_data.password, role="user")
+    except HTTPException:
+        raise  # FIXED: 防止 HTTPException 被 except Exception 吞掉重新包装为 500
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        logger.exception("User creation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create user. The username may already exist or a database error occurred.") from e
+
+    if not user:
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    return {"id": user.id, "username": user.username, "role": user.role}
+
+
+@router.get("/auth/me")
+async def get_current_user(_user: dict[str, Any] = Depends(require_guest)):
+    from protoforge.core.auth import user_manager
+    username = _user.get("username", "")
+    user = user_manager.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "created_at": user.created_at,
+        "locked": bool(user.locked_until and user.locked_until > time.time()),
+    }
+
+
+@router.get("/auth/users")
+async def list_users(_user: dict[str, Any] = Depends(require_admin)):
+    try:
+        from protoforge.core.auth import user_manager
+        return {"users": user_manager.list_users()}
+    except HTTPException:
+        raise  # FIXED: 防止 HTTPException 被 except Exception 吞掉重新包装为 500
+    except Exception as e:
+        logger.exception("Failed to list users: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to list users") from e
+
+
+@router.post("/auth/change-password")
+async def change_password(data: ChangePasswordRequest, _user: dict[str, Any] = Depends(require_guest)):
+    try:
+        from protoforge.core.auth import user_manager
+
+        current_user_id = _user.get("sub", "")
+        current_user = user_manager.get_user_by_id(current_user_id) if current_user_id else None
+        current_username = current_user.username if current_user else _user.get("username", "")
+
+        logger.debug(
+            "change_password: sub=%s user_found=%s username=%s",
+            current_user_id, current_user is not None, current_username,
+        )
+
+        if not current_username:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        ok, msg = await user_manager.change_password(current_username, data.old_password, data.new_password)
+
+        if not ok:
+            raise HTTPException(status_code=400, detail=msg)
+
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Change password failed: %s", e)
+        raise HTTPException(status_code=500, detail=desc("auth.password_change_failed")) from e
+
+
+@router.post("/auth/admin/reset-password")
+async def admin_reset_password(data: AdminResetPasswordRequest, _user: dict[str, Any] = Depends(require_admin)):
+    try:
+        from protoforge.core.auth import user_manager
+
+        ok, msg = await user_manager.admin_reset_password(data.username, data.new_password)
+
+        if not ok:
+            raise HTTPException(status_code=400, detail=msg)
+
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Admin reset password failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to reset password due to a database error. Please verify the target user exists and the database connection is healthy.") from e
+
+
+@router.put("/auth/users/{username}/role")
+async def update_user_role(username: str, data: UpdateRoleRequest, _user: dict[str, Any] = Depends(require_admin)):
+    try:
+        from protoforge.core.auth import user_manager
+        valid_roles = {"admin", "operator", "user", "viewer", "guest"}
+        if data.role not in valid_roles:
+            raise HTTPException(status_code=400, detail=f"Invalid role: {data.role}. Valid roles: {', '.join(sorted(valid_roles))}")
+        if not await user_manager.update_user_role(username, data.role):
+            raise HTTPException(status_code=400, detail="Failed to update role. Cannot demote the last admin.")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Update user role failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to update user role") from e
+
+
+@router.post("/auth/admin/unlock/{username}")
+async def admin_unlock_user(username: str, _user: dict[str, Any] = Depends(require_admin)):
+    try:
+        from protoforge.core.auth import user_manager
+        if not await user_manager.reset_login_attempts(username):
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unlock user failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to unlock user") from e
+
+
+@router.delete("/auth/users/{username}")
+async def delete_user(username: str, _user: dict[str, Any] = Depends(require_admin)):
+    try:
+        from protoforge.core.auth import user_manager
+        if not await user_manager.delete_user(username):
+            raise HTTPException(status_code=400, detail="Cannot delete this user. Admin account or last admin cannot be deleted.")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Delete user failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete user") from e

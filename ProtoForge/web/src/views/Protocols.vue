@@ -1,0 +1,831 @@
+<template>
+  <div>
+    <n-space vertical size="large">
+      <n-space justify="space-between" align="center">
+        <div>
+          <div class="pf-section-title">{{ t('protocols.title') }}</div>
+          <div class="pf-section-desc">{{ t('protocols.subtitle') }}</div>
+        </div>
+        <n-space>
+          <n-button type="primary" @click="startAll" :loading="startingAll" :disabled="startingAll || stoppingAll">
+            <template #icon><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg></template>
+            {{ t('protocols.startAll') }}
+          </n-button>
+          <n-button type="warning" @click="stopAll" :loading="stoppingAll" :disabled="startingAll || stoppingAll">
+            <template #icon><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></template>
+            {{ t('protocols.stopAll') }}
+          </n-button>
+        </n-space>
+      </n-space>
+
+      <n-spin :show="dataLoading">
+      <n-grid v-if="!dataLoading || protocols.length > 0" :cols="responsiveCols" :x-gap="16" :y-gap="16">
+        <n-gi v-for="p in protocols" :key="p.name">
+          <n-card size="small" hoverable>
+            <template #header>
+              <n-space align="center" size="small">
+                <div :style="{ width:'36px',height:'36px',borderRadius:'10px',display:'flex',alignItems:'center',justifyContent:'center',background: protocolColors[p.name] || '#f1f5f9' }">
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="white" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                </div>
+                <div>
+                  <div style="font-weight:600;font-size:14px">{{ p.display_name || p.name }}</div>
+                  <div style="font-size:11px;color:#94a3b8">{{ p.description || t('protocols.defaultDesc') }}</div>
+                </div>
+              </n-space>
+            </template>
+            <template #header-extra>
+              <n-tag :type="p.status === 'running' ? 'success' : 'default'" size="small" :bordered="false">
+                <template #icon v-if="p.status === 'running'">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                </template>
+                {{ p.status === 'running' ? t('common.running') : t('common.stopped') }}
+              </n-tag>
+            </template>
+            <n-space justify="space-between" align="center">
+              <n-space size="small" align="center">
+                <n-text depth="3" style="font-size:12px">{{ p.status === 'running' && p.effective_port ? t('common.port') + ' ' + p.effective_port : (p.default_port ? t('common.port') + ' ' + p.default_port : '') }}</n-text>
+                <n-tooltip trigger="hover">
+                  <template #trigger>
+                    <n-tag size="tiny" :type="protocolModes[p.name] === 'Broker' || protocolModes[p.name] === 'SIP' || protocolModes[p.name] === 'Agent' ? 'warning' : 'info'" :bordered="false" style="cursor:help">
+                      {{ protocolModes[p.name] || 'Server' }}
+                    </n-tag>
+                  </template>
+                  {{ t('protocols.roleHint.' + (protocolModes[p.name] || 'Server')) }}
+                </n-tooltip>
+              </n-space>
+              <n-space size="small">
+                <n-button v-if="p.status !== 'running'" type="primary" size="small" :loading="startingProtocol === p.name" @click="quickStart(p.name)">{{ t('protocols.quickStart') }}</n-button>
+                <n-button v-else type="warning" size="small" :loading="stoppingProtocol === p.name" @click="stopProtocol(p.name)">{{ t('common.stop') }}</n-button>
+                <n-button size="small" tertiary @click="openAdvanced(p)">{{ t('protocols.advancedConfig') }}</n-button>
+                <n-button size="small" tertiary @click="runDiagnose(p.name)">{{ t('protocols.diagnose') }}</n-button>
+                <n-button size="small" tertiary @click="showProtocolInfo(p.name)">{{ t('common.detail') }}</n-button>
+              </n-space>
+            </n-space>
+          </n-card>
+        </n-gi>
+      </n-grid>
+      <n-grid v-else :cols="responsiveCols" :x-gap="16" :y-gap="16">
+        <n-gi v-for="i in 6" :key="i">
+          <n-card size="small">
+            <n-skeleton text style="width:60%" />
+            <n-skeleton text style="width:40%" />
+            <n-skeleton text :repeat="2" style="margin-top:12px" />
+          </n-card>
+        </n-gi>
+      </n-grid>
+      <EmptyState v-if="protocols.length === 0 && !dataLoading"
+        :title="t('protocols.noProtocols')"
+        :description="t('protocols.noProtocolsDesc')"
+        iconPath="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
+      />
+      </n-spin>
+
+      <!-- Advanced Config Modal -->
+      <n-modal v-model:show="showAdvanced" preset="card" :title="t('protocols.advancedConfigTitle', { name: advancedProtocol.display_name || advancedProtocol.name })" style="width:min(560px, 90vw)">
+        <n-alert type="info" :bordered="false" style="margin-bottom: 12px">{{ t('protocols.advancedConfigHint') }}</n-alert>
+        <!-- GB28181 专属配置引导 -->
+        <n-alert v-if="advancedProtocol.name === 'gb28181'" type="warning" :bordered="false" style="margin-bottom: 12px" :title="t('protocols.gb28181ConfigTitle')">
+          <div style="font-size: 13px; line-height: 1.8">
+            <div style="font-weight: 600; margin-bottom: 4px">{{ t('protocols.gb28181ConfigMode') }}</div>
+            <div>{{ t('protocols.gb28181ConfigStep1') }}</div>
+            <div>{{ t('protocols.gb28181ConfigStep2') }}</div>
+            <div>{{ t('protocols.gb28181ConfigStep3') }}</div>
+            <div style="margin-top: 4px; color: #d97706">{{ t('protocols.gb28181ConfigWarning') }}</div>
+          </div>
+        </n-alert>
+        <n-form :model="advancedConfig" label-placement="left" label-width="120">
+          <n-form-item v-for="(info, key) in advancedConfigSchema" :key="key" :label="key">
+            <n-select v-if="info.type === 'boolean'" v-model:value="advancedConfig[key]" :options="booleanSelectOptions" style="width:100%" />
+            <n-input-number v-else-if="info.type === 'number' || info.type === 'integer'" v-model:value="advancedConfig[key]" :placeholder="String(info.default ?? '')" style="width:100%" />
+            <n-input v-else v-model:value="advancedConfig[key]" :placeholder="String(info.default ?? '')" />
+            <template #feedback v-if="info.description"><n-text depth="3" style="font-size:12px">{{ info.description }}</n-text></template>
+          </n-form-item>
+        </n-form>
+        <template #action>
+          <n-space>
+            <n-button @click="showAdvanced = false">{{ t('common.cancel') }}</n-button>
+            <n-button type="primary" @click="startWithConfig" :loading="starting">{{ t('common.start') }}</n-button>
+          </n-space>
+        </template>
+      </n-modal>
+
+      <!-- Protocol Detail Modal -->
+      <n-modal v-model:show="showInfoModal" preset="card" :title="t('protocols.protocolDetailTitle', { name: protocolInfoName })" style="width:min(600px, 90vw)">
+        <n-spin :show="loadingInfo">
+          <n-space vertical v-if="protocolInfoData">
+            <n-descriptions label-placement="left" :column="1" bordered size="small">
+              <n-descriptions-item :label="t('common.protocolName')">{{ protocolInfoData.name || protocolInfoName }}</n-descriptions-item>
+              <n-descriptions-item :label="t('common.displayName')">{{ protocolInfoData.display_name || '-' }}</n-descriptions-item>
+              <n-descriptions-item :label="t('common.description')">{{ protocolInfoData.description || '-' }}</n-descriptions-item>
+              <n-descriptions-item :label="t('common.defaultPort')">{{ protocolInfoData.default_port || '-' }}</n-descriptions-item>
+              <n-descriptions-item :label="t('common.mode')">{{ protocolInfoData.mode || 'Server' }}</n-descriptions-item>
+              <n-descriptions-item :label="t('common.version')">{{ protocolInfoData.version || '-' }}</n-descriptions-item>
+            </n-descriptions>
+            <n-text strong v-if="protocolInfoData.features && protocolInfoData.features.length > 0" style="font-size:13px">{{ t('common.features') }}:</n-text>
+            <n-space v-if="protocolInfoData.features && protocolInfoData.features.length > 0" size="small">
+              <n-tag v-for="f in protocolInfoData.features" :key="f" size="tiny" type="info" :bordered="false">{{ f }}</n-tag>
+            </n-space>
+            <n-text strong v-if="protocolConfigData && Object.keys(protocolConfigData).length > 0" style="font-size:13px">{{ t('common.configParams') }}:</n-text>
+            <n-data-table v-if="protocolConfigData && Object.keys(protocolConfigData).length > 0"
+              :columns="configInfoColumns" :data="configInfoRows" :bordered="false" size="small" />
+          </n-space>
+        </n-spin>
+        <template #action>
+          <n-button @click="showInfoModal = false">{{ t('common.close') }}</n-button>
+        </template>
+      </n-modal>
+
+      <!-- Start Progress Modal -->
+      <n-modal v-model:show="showProgressModal" :mask-closable="false" :close-on-esc="false" preset="card"
+        :title="progressModalTitle" style="width:min(520px, 90vw)">
+        <div style="min-height: 180px">
+          <!-- Single protocol start progress -->
+          <template v-if="progressMode === 'single-start' || progressMode === 'single-stop'">
+            <div style="text-align:center;padding: 16px 0 8px">
+              <div style="font-size:15px;font-weight:500;margin-bottom:16px">
+                {{ progressMode === 'single-start' ? t('protocols.startingProtocol', { name: progressTarget }) : t('protocols.stoppingProtocol', { name: progressTarget }) }}
+              </div>
+              <!-- Step indicators -->
+              <n-space vertical size="large" style="max-width:320px;margin:0 auto;text-align:left">
+                <div v-for="(step, idx) in progressSteps" :key="idx"
+                  :style="{ display:'flex', alignItems:'center', gap:'12px', opacity: getStepOpacity(idx), transition: 'all 0.4s ease' }">
+                  <div :style="{ width:'28px',height:'28px',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'13px',fontWeight:600,transition:'all 0.4s ease',background: getStepBg(idx), color: getStepColor(idx) }">
+                    <svg v-if="step.status === 'done'" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+                    <svg v-else-if="step.status === 'error'" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    <n-spin v-else-if="step.status === 'active'" :size="14" />
+                    <span v-else>{{ idx + 1 }}</span>
+                  </div>
+                  <span :style="{ fontSize:'14px', color: step.status === 'pending' ? '#94a3b8' : step.status === 'error' ? '#e88080' : '#334155', fontWeight: step.status === 'active' ? 600 : 400, transition: 'all 0.3s ease' }">{{ step.label }}</span>
+                </div>
+              </n-space>
+              <!-- Error message -->
+              <n-alert v-if="progressError" type="error" :bordered="false" style="margin-top:16px;text-align:left">
+                {{ progressError }}
+              </n-alert>
+            </div>
+          </template>
+
+          <!-- Batch start/stop progress -->
+          <template v-if="progressMode === 'batch-start' || progressMode === 'batch-stop'">
+            <div style="margin-bottom:12px">
+              <n-progress :percentage="batchPercentage" :show-indicator="true"
+                :status="batchHasError ? 'warning' : 'success'"
+                :height="8" :border-radius="4" />
+              <div style="text-align:center;margin-top:8px;font-size:13px;color:#64748b">
+                {{ progressMode === 'batch-start'
+                  ? t('protocols.batchProgress', { current: batchCurrent, total: batchTotal })
+                  : t('protocols.batchProgress', { current: batchCurrent, total: batchTotal }) }}
+              </div>
+            </div>
+            <div style="max-height:240px;overflow-y:auto">
+              <div v-for="item in batchItems" :key="item.name"
+                :style="{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'8px 12px', borderRadius:'8px', marginBottom:'4px', background: item.status === 'active' ? '#f0f9ff' : item.status === 'success' ? '#f0fdf4' : item.status === 'error' ? '#fef2f2' : 'transparent', transition: 'all 0.3s ease' }">
+                <div style="display:flex;align-items:center;gap:8px">
+                  <div :style="{ width:'8px',height:'8px',borderRadius:'50%',background: item.status === 'success' ? '#18a058' : item.status === 'error' ? '#d03050' : item.status === 'active' ? '#2080f0' : '#c0c4cc', transition: 'all 0.3s ease' }">
+                    <div v-if="item.status === 'active'" style="width:8px;height:8px;border-radius:50%;background:#2080f0;animation:pulse 1.5s ease-in-out infinite"></div>
+                  </div>
+                  <span style="font-size:13px;font-weight:500">{{ item.displayName || item.name }}</span>
+                </div>
+                <n-tag :type="item.status === 'success' ? 'success' : item.status === 'error' ? 'error' : item.status === 'active' ? 'info' : 'default'"
+                  size="tiny" :bordered="false">
+                  {{ item.status === 'success' ? t('protocols.batchItemSuccess')
+                    : item.status === 'error' ? t('protocols.batchItemFailed')
+                    : item.status === 'active' ? t('protocols.batchItemStarting')
+                    : t('protocols.batchItemPending') }}
+                </n-tag>
+              </div>
+            </div>
+          </template>
+        </div>
+        <template #action>
+          <n-button v-if="progressDone" type="primary" @click="closeProgressModal">{{ t('common.close') }}</n-button>
+          <n-button v-else disabled>{{ t('protocols.batchItemStarting') }}</n-button>
+        </template>
+      </n-modal>
+
+      <!-- 连接诊断弹窗（UX：一键体检"连不上"类问题） -->
+      <n-modal v-model:show="showDiag" preset="card" :title="t('protocols.diagnosticsTitle', { name: diagProtocol })" style="width:min(560px, 90vw)">
+        <n-spin :show="diagLoading">
+          <n-space vertical size="small">
+            <template v-if="diagResult">
+              <n-alert :type="diagResult.ok ? (diagHasWarn ? 'warning' : 'success') : 'error'" :bordered="false">
+                {{ diagResult.ok ? (diagHasWarn ? t('protocols.diagAllPassWarn') : t('protocols.diagAllPass')) : t('protocols.diagHasFail') }}
+              </n-alert>
+              <div v-for="c in diagResult.checks" :key="c.key" style="display:flex;align-items:flex-start;gap:8px;padding:6px 10px;border-radius:6px;background:rgba(128,128,128,0.08)">
+                <span :style="{ color: c.warn ? '#f0a020' : (c.ok ? '#18a058' : '#d03050'), fontWeight: 700, minWidth: '14px' }">{{ c.warn ? '⚠' : (c.ok ? '✓' : '✗') }}</span>
+                <div>
+                  <div style="font-size:13px">{{ t('protocols.diag_' + c.key) }}<n-text depth="3" style="font-size:12px;margin-left:8px">{{ c.detail }}</n-text></div>
+                  <n-text v-if="(c.warn || !c.ok) && c.suggestion" type="warning" style="font-size:12px;white-space:pre-wrap">{{ t('protocols.' + c.suggestion) }}</n-text>
+                </div>
+              </div>
+            </template>
+            <n-divider style="margin:8px 0" />
+            <div style="font-size:13px;font-weight:600">{{ t('protocols.outboundTest') }}</div>
+            <n-space size="small">
+              <n-input v-model:value="diagOutHost" :placeholder="t('protocols.outboundHost')" style="width:200px" size="small" />
+              <n-input-number v-model:value="diagOutPort" size="small" style="width:120px" :placeholder="t('common.port')" />
+              <n-button size="small" type="primary" :loading="diagOutLoading" @click="runOutboundTest">{{ t('protocols.outboundTestBtn') }}</n-button>
+            </n-space>
+            <n-alert v-if="diagOutResult" :type="diagOutResult.ok ? 'success' : 'error'" :bordered="false" size="small">
+              {{ diagOutResult.ok ? t('protocols.outboundOk', { ms: diagOutResult.latency_ms }) : t('protocols.outboundFail', { error: diagOutResult.error || '' }) }}
+            </n-alert>
+          </n-space>
+        </n-spin>
+        <template #action>
+          <n-space justify="space-between" style="width:100%">
+            <n-button size="small" @click="runDiagnose(diagProtocol)" :loading="diagLoading">{{ t('protocols.diagRerun') }}</n-button>
+            <n-button @click="showDiag = false">{{ t('common.close') }}</n-button>
+          </n-space>
+        </template>
+      </n-modal>
+    </n-space>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { NSpace, NGrid, NGi, NCard, NTag, NButton, NAlert, NModal, NForm, NFormItem, NInput, NInputNumber, NText, NDescriptions, NDescriptionsItem, NDataTable, NSpin, NProgress, NSkeleton, NTooltip, NDivider, useMessage, useDialog } from 'naive-ui'
+import api from '../api.js'
+import { useI18n } from '../i18n.js'
+import { protocolColors, protocolModes } from '../constants.js'
+import EmptyState from '../components/EmptyState.vue'
+import { useWebSocketPool } from '../composables/useWebSocketPool'
+
+const message = useMessage()
+const { t } = useI18n()
+const dialog = useDialog()
+const protocols = ref([])
+const dataLoading = ref(false)
+const showAdvanced = ref(false)
+const starting = ref(false)
+const startingProtocol = ref(null)
+const stoppingProtocol = ref(null)
+const startingAll = ref(false)
+const stoppingAll = ref(false)
+const advancedProtocol = ref({})
+const advancedConfig = ref({})
+const advancedConfigSchema = computed(() => {
+  const schema = advancedProtocol.value.config_schema || {}
+  const properties = schema.properties || {}
+  return properties
+})
+// FIXED(用户反馈 v1.6.33): schema 的 boolean 字段（如 ab/fanuc 的 raw_frames）
+// 渲染为真开关而非文本框，避免用户填 "false" 字符串被非空判断误判为开启
+const booleanSelectOptions = computed(() => [
+  { label: t('common.true'), value: true },
+  { label: t('common.false'), value: false },
+])
+
+const showInfoModal = ref(false)
+const protocolInfoName = ref('')
+const protocolInfoData = ref(null)
+
+// 连接诊断（UX）
+const showDiag = ref(false)
+const diagProtocol = ref('')
+const diagLoading = ref(false)
+const diagResult = ref(null)
+const diagHasWarn = computed(() => !!(diagResult.value?.has_warn || (diagResult.value?.checks || []).some(c => c.warn)))
+const diagOutHost = ref('')
+const diagOutPort = ref(1883)
+const diagOutLoading = ref(false)
+const diagOutResult = ref(null)
+
+async function runDiagnose(name) {
+  diagProtocol.value = name
+  showDiag.value = true
+  diagLoading.value = true
+  diagResult.value = null
+  try {
+    diagResult.value = await api.diagnoseProtocol(name)
+  } catch (e) {
+    message.error(t('protocols.diagFailed') + ': ' + (e.response?.data?.detail || e.message))
+  } finally {
+    diagLoading.value = false
+  }
+}
+
+async function runOutboundTest() {
+  if (!diagOutHost.value || !diagOutPort.value) return
+  diagOutLoading.value = true
+  diagOutResult.value = null
+  try {
+    diagOutResult.value = await api.diagnoseOutbound(diagOutHost.value, Number(diagOutPort.value))
+  } catch (e) {
+    diagOutResult.value = { ok: false, error: e.response?.data?.error || e.message }
+  } finally {
+    diagOutLoading.value = false
+  }
+}
+const protocolConfigData = ref(null)
+const loadingInfo = ref(false)
+
+const configInfoColumns = computed(() => [
+  { title: t('protocols.param'), key: 'key', width: 140 },
+  { title: t('common.type'), key: 'type', width: 100 },
+  { title: t('protocols.defaultValue'), key: 'default', width: 120 },
+  { title: t('common.description'), key: 'description' },
+])
+
+const configInfoRows = computed(() => {
+  if (!protocolConfigData.value) return []
+  return Object.entries(protocolConfigData.value)
+    .filter(([_, info]) => info !== null && info !== undefined)
+    .map(([key, info]) => ({
+      key,
+      type: (info && info.type) || '-',
+      default: (info && info.default) ?? '-',
+      description: (info && info.description) || '-',
+    }))
+})
+
+// ---- Progress Modal State ----
+const showProgressModal = ref(false)
+const progressMode = ref('') // 'single-start' | 'single-stop' | 'batch-start' | 'batch-stop'
+const progressTarget = ref('')
+const progressSteps = ref([])
+const progressError = ref('')
+const progressDone = ref(false)
+
+// Batch state
+const batchItems = ref([])
+const batchCurrent = ref(0)
+const batchTotal = ref(0)
+const batchHasError = ref(false)
+
+const progressModalTitle = computed(() => {
+  if (progressMode.value === 'single-start') return progressDone.value
+    ? (progressError.value ? t('protocols.startErrorTitle') : t('protocols.startSuccessTitle'))
+    : t('protocols.startingTitle')
+  if (progressMode.value === 'single-stop') return progressDone.value
+    ? (progressError.value ? t('protocols.stopErrorTitle') : t('protocols.stopSuccessTitle'))
+    : t('protocols.stoppingTitle')
+  if (progressMode.value === 'batch-start') return progressDone.value
+    ? t('protocols.batchSuccessTitle')
+    : t('protocols.batchStartingTitle')
+  if (progressMode.value === 'batch-stop') return progressDone.value
+    ? t('protocols.batchSuccessTitle')
+    : t('protocols.batchStoppingTitle')
+  return ''
+})
+
+const batchPercentage = computed(() => {
+  if (batchTotal.value === 0) return 0
+  return Math.round((batchCurrent.value / batchTotal.value) * 100)
+})
+
+function getStepOpacity(idx) {
+  const step = progressSteps.value[idx]
+  if (!step) return 0.4
+  if (step.status === 'done' || step.status === 'active' || step.status === 'error') return 1
+  return 0.4
+}
+
+function getStepBg(idx) {
+  const step = progressSteps.value[idx]
+  if (!step) return '#f1f5f9'
+  if (step.status === 'done') return '#18a058'
+  if (step.status === 'active') return '#2080f0'
+  if (step.status === 'error') return '#d03050'
+  return '#f1f5f9'
+}
+
+function getStepColor(idx) {
+  const step = progressSteps.value[idx]
+  if (!step) return '#94a3b8'
+  if (step.status === 'done' || step.status === 'active' || step.status === 'error') return '#fff'
+  return '#94a3b8'
+}
+
+function closeProgressModal() {
+  showProgressModal.value = false
+  progressMode.value = ''
+  progressSteps.value = []
+  progressError.value = ''
+  progressDone.value = false
+  batchItems.value = []
+  batchCurrent.value = 0
+  batchTotal.value = 0
+  batchHasError.value = false
+}
+
+// Animate steps for single protocol start/stop
+async function animateSteps(name, action) {
+  const isStart = action === 'start'
+  const stepLabels = isStart
+    ? [t('protocols.startStepInit'), t('protocols.startStepPort'), t('protocols.startStepEngine'), t('protocols.startStepReady')]
+    : [t('protocols.startStepInit'), t('protocols.startStepEngine'), t('protocols.startStepReady')]
+
+  progressSteps.value = stepLabels.map(label => ({ label, status: 'pending' }))
+  progressError.value = ''
+  progressDone.value = false
+
+  // Step 1: Init
+  progressSteps.value[0].status = 'active'
+  await delay(400)
+  progressSteps.value[0].status = 'done'
+
+  // Step 2: Port / Engine
+  progressSteps.value[1].status = 'active'
+  await delay(350)
+
+  // Actual API call happens in parallel with step animation
+  return { stepLabels }
+}
+
+async function finishStepsSuccess() {
+  // Mark remaining steps as done
+  for (let i = 0; i < progressSteps.value.length; i++) {
+    if (progressSteps.value[i].status !== 'done') {
+      progressSteps.value[i].status = 'active'
+      await delay(250)
+      progressSteps.value[i].status = 'done'
+    }
+  }
+  progressDone.value = true
+}
+
+async function finishStepsError(error) {
+  // Mark current active step as error, remaining as pending
+  for (const step of progressSteps.value) {
+    if (step.status === 'active') step.status = 'error'
+    else if (step.status === 'pending') break
+  }
+  progressError.value = error
+  progressDone.value = true
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function loadData() {
+  dataLoading.value = true
+  try {
+    const res = await api.getProtocols()
+    protocols.value = res || []
+  } catch (e) {
+    message.error(t('protocols.loadFailed') + ': ' + (e.response?.data?.detail || e.message))
+  } finally { dataLoading.value = false }
+}
+
+// ---- Single Protocol Start with Progress ----
+async function quickStart(name) {
+  dialog.warning({
+    title: t('protocols.confirmStart'),
+    content: t('protocols.confirmStartDesc', { name }),
+    positiveText: t('common.start'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => {
+      doStartProtocol(name, null)
+    }
+  })
+}
+
+async function doStartProtocol(name, config) {
+  startingProtocol.value = name
+  progressMode.value = 'single-start'
+  progressTarget.value = name
+  showProgressModal.value = true
+
+  // Start step animation
+  const stepLabels = [t('protocols.startStepInit'), t('protocols.startStepPort'), t('protocols.startStepEngine'), t('protocols.startStepReady')]
+  progressSteps.value = stepLabels.map(label => ({ label, status: 'pending' }))
+  progressError.value = ''
+  progressDone.value = false
+
+  // Animate step 1 (init)
+  progressSteps.value[0].status = 'active'
+  await delay(400)
+  progressSteps.value[0].status = 'done'
+
+  // Animate step 2 (port) - start API call in parallel
+  progressSteps.value[1].status = 'active'
+  const apiPromise = api.startProtocol(name, config)
+
+  await delay(350)
+  progressSteps.value[1].status = 'done'
+
+  // Step 3 (engine) - wait for API
+  progressSteps.value[2].status = 'active'
+
+  try {
+    const res = await apiPromise
+    progressSteps.value[2].status = 'done'
+
+    // Step 4 (ready)
+    progressSteps.value[3].status = 'active'
+    await delay(300)
+    progressSteps.value[3].status = 'done'
+    progressDone.value = true
+
+    if (res.port_changed) {
+      message.warning(res.message, { duration: 6000 })
+    }
+    await loadData()
+  } catch (e) {
+    const errMsg = e.response?.data?.detail || e.message
+    progressSteps.value[2].status = 'error'
+    progressError.value = t('protocols.startErrorDesc', { name, error: errMsg })
+    progressDone.value = true
+  } finally {
+    startingProtocol.value = null
+  }
+}
+
+// ---- Single Protocol Stop with Progress ----
+async function stopProtocol(name) {
+  dialog.warning({
+    title: t('protocols.confirmStop'),
+    content: t('protocols.confirmStopDesc', { name }),
+    positiveText: t('common.stop'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => {
+      doStopProtocol(name)
+    }
+  })
+}
+
+async function doStopProtocol(name) {
+  stoppingProtocol.value = name
+  progressMode.value = 'single-stop'
+  progressTarget.value = name
+  showProgressModal.value = true
+
+  const stepLabels = [t('protocols.startStepInit'), t('protocols.startStepEngine'), t('protocols.startStepReady')]
+  progressSteps.value = stepLabels.map(label => ({ label, status: 'pending' }))
+  progressError.value = ''
+  progressDone.value = false
+
+  progressSteps.value[0].status = 'active'
+  await delay(300)
+  progressSteps.value[0].status = 'done'
+
+  progressSteps.value[1].status = 'active'
+  try {
+    await api.stopProtocol(name)
+    progressSteps.value[1].status = 'done'
+
+    progressSteps.value[2].status = 'active'
+    await delay(250)
+    progressSteps.value[2].status = 'done'
+    progressDone.value = true
+
+    await loadData()
+  } catch (e) {
+    const errMsg = e.response?.data?.detail || e.message
+    progressSteps.value[1].status = 'error'
+    progressError.value = t('protocols.stopErrorDesc', { name, error: errMsg })
+    progressDone.value = true
+  } finally {
+    stoppingProtocol.value = null
+  }
+}
+
+// ---- Batch Start with Progress ----
+async function startAll() {
+  const stopped = protocols.value.filter(p => p.status !== 'running')
+  if (!stopped.length) { message.info(t('protocols.allRunning')); return }
+  dialog.warning({
+    title: t('protocols.confirmStartAll'),
+    content: t('protocols.confirmStartAllDesc', { count: stopped.length }),
+    positiveText: t('common.start'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => {
+      doStartAll(stopped)
+    }
+  })
+}
+
+async function doStartAll(stopped) {
+  startingAll.value = true
+  progressMode.value = 'batch-start'
+  batchTotal.value = stopped.length
+  batchCurrent.value = 0
+  batchHasError.value = false
+  batchItems.value = stopped.map(p => ({
+    name: p.name,
+    displayName: p.display_name || p.name,
+    status: 'pending'
+  }))
+  showProgressModal.value = true
+  progressDone.value = false
+
+  let successCount = 0
+  let failCount = 0
+
+  for (let i = 0; i < stopped.length; i++) {
+    const p = stopped[i]
+    batchItems.value[i].status = 'active'
+    batchCurrent.value = i + 1
+
+    try {
+      await api.startProtocol(p.name, null)
+      batchItems.value[i].status = 'success'
+      successCount++
+    } catch (e) {
+      batchItems.value[i].status = 'error'
+      failCount++
+      batchHasError.value = true
+    }
+
+    // Small delay between protocols for visual effect
+    if (i < stopped.length - 1) await delay(200)
+  }
+
+  progressDone.value = true
+  startingAll.value = false
+
+  if (failCount > 0 && successCount > 0) {
+    message.warning(t('protocols.batchPartialDesc', { success: successCount, fail: failCount }))
+  } else if (successCount > 0) {
+    message.success(t('protocols.batchSuccessDesc', { success: successCount }))
+  }
+
+  await loadData()
+}
+
+// ---- Batch Stop with Progress ----
+async function stopAll() {
+  const running = protocols.value.filter(p => p.status === 'running')
+  if (!running.length) { message.info(t('protocols.allStopped')); return }
+  dialog.warning({
+    title: t('protocols.confirmStopAll'),
+    content: t('protocols.confirmStopAllDesc', { count: running.length }),
+    positiveText: t('common.stop'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => {
+      doStopAll(running)
+    }
+  })
+}
+
+async function doStopAll(running) {
+  stoppingAll.value = true
+  progressMode.value = 'batch-stop'
+  batchTotal.value = running.length
+  batchCurrent.value = 0
+  batchHasError.value = false
+  batchItems.value = running.map(p => ({
+    name: p.name,
+    displayName: p.display_name || p.name,
+    status: 'pending'
+  }))
+  showProgressModal.value = true
+  progressDone.value = false
+
+  let successCount = 0
+  let failCount = 0
+
+  for (let i = 0; i < running.length; i++) {
+    const p = running[i]
+    batchItems.value[i].status = 'active'
+    batchCurrent.value = i + 1
+
+    try {
+      await api.stopProtocol(p.name)
+      batchItems.value[i].status = 'success'
+      successCount++
+    } catch (e) {
+      batchItems.value[i].status = 'error'
+      failCount++
+      batchHasError.value = true
+    }
+
+    if (i < running.length - 1) await delay(200)
+  }
+
+  progressDone.value = true
+  stoppingAll.value = false
+
+  if (failCount > 0 && successCount > 0) {
+    message.warning(t('protocols.stopAllPartial', { success: successCount, fail: failCount }))
+  } else if (successCount > 0) {
+    message.success(t('protocols.stopAllSuccess', { count: successCount }))
+  }
+
+  await loadData()
+}
+
+async function showProtocolInfo(name) {
+  protocolInfoName.value = name
+  showInfoModal.value = true
+  loadingInfo.value = true
+  protocolInfoData.value = null
+  protocolConfigData.value = null
+  try {
+    const results = await Promise.allSettled([
+      api.getProtocolInfo(),
+      api.getProtocolConfig(name),
+    ])
+    const infoRes = results[0].status === 'fulfilled' ? results[0].value : {}
+    const configRes = results[1].status === 'fulfilled' ? results[1].value : {}
+    if (results[0].status === 'rejected') message.warning(t('protocols.infoLoadFailed'))
+    if (results[1].status === 'rejected') message.warning(t('protocols.configLoadFailed'))
+    const infoList = Array.isArray(infoRes) ? infoRes : (infoRes.protocols || [])
+    const found = infoList.find(p => p.name === name) || protocols.value.find(p => p.name === name) || { name }
+    protocolInfoData.value = found
+    protocolConfigData.value = configRes.properties || configRes.config_schema?.properties || (Object.keys(configRes).length > 0 ? configRes : {})
+  } catch (e) {
+    protocolInfoData.value = protocols.value.find(p => p.name === name) || { name }
+    protocolConfigData.value = {}
+  } finally { loadingInfo.value = false }
+}
+
+function openAdvanced(p) {
+  advancedProtocol.value = p
+  try {
+    const schema = p.config_schema || {}
+    const properties = schema.properties || schema
+    // FIXED: 协议运行中时回显实际生效的启动配置（引擎记录的 running_config），
+    // 而不是 schema 默认值 —— 否则用户改过 host/port 后再打开弹窗看到的还是 0.0.0.0
+    const last = (p.status === 'running' && p.running_config) || null
+    advancedConfig.value = {}
+    for (const [key, info] of Object.entries(properties)) {
+      if (info !== null && info !== undefined && typeof info === 'object' && info.type) {
+        const actual = last ? last[key] : undefined
+        // FIXED(用户反馈 v1.6.33): boolean 字段归一为真正的布尔值 —— 历史 running_config
+        // 里可能是 "true"/"false" 字符串（旧版文本框），需转换后才能正确回显开关
+        if (info.type === 'boolean') {
+          const s = typeof actual === 'string' ? actual.trim().toLowerCase() : actual
+          advancedConfig.value[key] = s === true || s === 'true' || s === 1 || s === '1'
+            ? true
+            : (s === false || s === 'false' || s === 0 || s === '0' ? false : (info.default ?? false))
+        } else {
+          advancedConfig.value[key] = (actual !== undefined && actual !== null && actual !== '') ? actual : (info.default ?? '')
+        }
+      }
+    }
+  } catch (e) {
+    advancedConfig.value = {}
+  }
+  showAdvanced.value = true
+}
+
+async function startWithConfig() {
+  starting.value = true
+  try {
+    const config = {}
+    const schemaProps = advancedConfigSchema.value || {}
+    for (const [key, value] of Object.entries(advancedConfig.value)) {
+      if (value !== '' && value !== null && value !== undefined) {
+        // FIXED(用户反馈 v1.6.33): boolean 字段强制归一为真布尔值，不再落入数字转换
+        if (schemaProps[key]?.type === 'boolean') {
+          config[key] = value === true || value === 'true' || value === 1 || value === '1'
+          continue
+        }
+        config[key] = (String(value).trim() !== '' && !isNaN(Number(value))) ? Number(value) : value
+      }
+    }
+    showAdvanced.value = false
+    await doStartProtocol(advancedProtocol.value.name, config)
+  } catch (e) {
+    message.error(t('protocols.startFailed') + ': ' + (e.response?.data?.detail || e.message))
+  } finally {
+    starting.value = false
+  }
+}
+
+const windowWidth = ref(window.innerWidth)
+function onResize() { windowWidth.value = window.innerWidth }
+
+const responsiveCols = computed(() => {
+  if (windowWidth.value < 768) return 1
+  if (windowWidth.value < 1200) return 2
+  return 3
+})
+
+const { getConnection } = useWebSocketPool()
+
+onMounted(() => {
+  loadData()
+  wsConn = getConnection('protocols-devices', () => api.createDeviceWs())
+  wsConn.subscribe({
+    onMessage: (msg) => {
+      if (msg.type === 'devices') {
+        if (wsLoadDataTimer) clearTimeout(wsLoadDataTimer)
+        wsLoadDataTimer = setTimeout(() => { loadData() }, 300)
+      }
+    }
+  })
+  wsConn.connect()
+  window.addEventListener('resize', onResize)
+})
+
+onUnmounted(() => {
+  if (wsConn) { wsConn.disconnect(); wsConn = null }
+  if (wsLoadDataTimer) { clearTimeout(wsLoadDataTimer); wsLoadDataTimer = null }
+  window.removeEventListener('resize', onResize)
+})
+
+let wsConn = null
+let wsLoadDataTimer = null
+</script>
+
+<style scoped>
+@keyframes pulse {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.3); }
+  100% { opacity: 1; transform: scale(1); }
+}
+</style>
