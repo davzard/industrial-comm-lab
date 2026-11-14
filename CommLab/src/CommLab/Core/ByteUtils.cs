@@ -11,7 +11,7 @@ public static class ByteUtils
     /// <summary>字节数组 → 十六进制字符串，如 "01 03 00 00 00 0A C5 CD"</summary>
     public static string Hex(ReadOnlySpan<byte> data)
     {
-        var sb = new StringBuilder(data.Length * 3);
+        var sb = new StringBuilder(data.Length * 3);//每一个字节占 2 个 hex + 1 个空格
         for (int i = 0; i < data.Length; i++)
         {
             if (i > 0) sb.Append(' ');
